@@ -1,0 +1,2 @@
+{"type":"bridge-session","sessionId":"session-e","bridgeSessionId":"bridge-session-e","lastSequenceNum":1,"ownerAccountUuid":"00000000-0000-4000-8000-0000000000aa","ownerOrganizationUuid":"00000000-0000-4000-8000-000000000002"}
+{"type":"assistant","sessionId":"session-e","timestamp":"2026-10-04T11:59:55.000Z","requestId":"e1","message":{"id":"msg-e1","model":"claude-haiku-4-5","usage":{"input_tokens":64000000,"output_tokens":0}}}

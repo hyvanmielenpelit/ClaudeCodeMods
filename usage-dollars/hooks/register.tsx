@@ -36,8 +36,8 @@ async function toastNotices($: EngineInterface) {
   for (const text of await takeToasts(hostOf($))) $.ui.toast(text, { timeoutMs: 10000 })
 }
 
-function measureThen($: EngineInterface, limits?: readonly SessionRateLimit[], isForced = false, isFresh = false) {
-  return refresh(hostOf($), limits, isForced, isFresh).then(async summary => {
+function measureThen($: EngineInterface, limits?: readonly SessionRateLimit[], isForced = false, isFresh = false, receivedAt?: number) {
+  return refresh(hostOf($), limits, isForced, isFresh, receivedAt).then(async summary => {
     await toastNotices($)
     return summary
   })
@@ -83,10 +83,12 @@ export const register: Register = on => {
   })
 
   /* Only here does the session hold a percent it has just received: a billed response, or
-     a window that moved a whole point. */
+     a window that moved a whole point. Its readings pair the percent with the dollars up
+     to the moment it arrived, not to when the scan runs. */
   on('session.measure', async ($, e, next) => {
+    const receivedAt = await $.clock.now()
     const isFresh = e.changed.includes('cost') || e.changed.includes('rateLimits')
-    void measureThen($, e.rateLimits, e.changed.includes('rateLimits'), isFresh)
+    void measureThen($, e.rateLimits, e.changed.includes('rateLimits'), isFresh, receivedAt)
     return next(e)
   })
 

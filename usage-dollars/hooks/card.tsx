@@ -35,8 +35,8 @@ export function modelName(id: string) {
 }
 
 const FOOTNOTE =
-  "Priced at API list rates from this machine's transcripts. Ranges are 90% intervals: they combine " +
-  "the limit's whole-percent rounding with how far API prices may differ from the limit's own weighting."
+  "Priced at API list rates from this machine's transcripts. Ranges are 90% intervals from a model of " +
+  'how far dollars per percent vary within and between windows; see the README.'
 
 const FOOTER =
   '/usage-dollars 24h · 7d · YYYY-MM-DD..YYYY-MM-DD for a spending report · /usage-dollars reset after a plan change'

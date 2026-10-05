@@ -95,7 +95,7 @@ know the limits really changed.
 
 | Data | After `reset` |
 |------|---------------|
-| Closed windows' readings and rate-limit rejections from before the reset | No longer feed the prior or the measured mix error. The mix error falls back to the assumed 10% until enough new windows close. |
+| Closed windows' readings and rate-limit rejections from before the reset | No longer feed the prior or the measured spreads. Both spreads fall back to their assumed values until new windows close. |
 | The current window's readings taken before the reset | Excluded. The estimate rebuilds from readings taken after it; the first scan after it takes one at once. |
 | The current window's used dollars | Unchanged: they are a fact about spending, not about the limit. |
 | The plan ledger, spending reports, the 24-hour figure, per-model tables | Unchanged. |
@@ -117,43 +117,70 @@ promotion change can no longer be undone.
   record is taken to bill the signed-in subscription. Checked against Claude Code's own
   per-session costs it usually comes within a few percent, and up to a quarter low on long
   sessions, because some billed calls never reach a transcript.
-- **Allowance** and **left** come from the limit's own reading. The API reports the
-  window's usage in whole percent, so each reading pins the allowance between two bounds,
-  `used / (p + 1)%` and `used / (p - 0.5)%` while it is not known whether the API rounds
-  or truncates. Once closed windows show which it does, the tighter bounds of that rule
-  apply. The mod keeps the readings of every window and intersects them, so the bounds
-  narrow each time the percent ticks over. A reading is taken only when this session has
-  just received the percent, after its own turn or when the percent moves, and is paired
-  with the dollars of that moment; running sessions share the freshest percent between
-  them. Readings that contradict the rest are set aside, the newest kept, and counted in
-  the card's basis line.
-- **The 90% range** widens those bounds by how far API prices may differ from the limit's
-  own weighting of tokens: the spread of past windows' allowances, never taken below 3%,
-  once there are effectively at least three, otherwise an assumed 10%. Past windows also
-  act as a prior. They come from the mod's own readings of closed windows and from
-  rate-limit rejections in the last 14 days of transcripts, each a window seen exactly
-  full. Older windows count for less: a past 5-hour window loses half its weight every day,
-  a past week every 14 days, so the estimate follows a change of limits quickly. The card's
+- **Readings.** The API reports the window's usage in whole percent, and the percent a
+  response carries includes that response. A reading is taken only when this session has
+  just received the percent, and pairs it with the dollars counted up to the moment it
+  arrived, not up to when the scan runs. Another session's request in the 30 seconds
+  before that moment may or may not be in the percent yet; its dollars are kept with the
+  reading as slack. Running sessions share the freshest percent between them. No reading
+  is taken while more than 2% of a window's requests go to unpriced models, and readings
+  priced with an older price table are dropped.
+- **Allowance** rests on the newest percent level. When the level below it was read too,
+  the percent ticked over between those two readings, and the dollars at that moment
+  divided by the share at the tick give the dollars per percent; otherwise the share
+  anywhere in the level's interval does. Until closed windows show whether the API rounds
+  or truncates, the tick is either rule's, and the range covers both. A level of 100% is
+  used only through its crossing: spending can continue past the limit.
+- **The 90% range** comes from a stated model. The dollars one percent costs vary within
+  a window, because API prices weight tokens differently from the limit. Read at share
+  `s`, the dollars per percent so far differ from the whole window's by a relative spread
+  `omega · √(1/s − 1/100)`, which vanishes as the window fills; so "left" narrows as it
+  is used. Between windows the allowance itself varies by `tau`. Past windows act as a
+  prior that is combined with the current reading by precision, unless the two disagree
+  beyond chance; then the reading alone counts and the card says limits may have changed.
+  The interval uses Student's t, so few past windows widen it.
+- **Two spreads start as assumptions**: `omega = 0.5` within a window and `tau = 10%`
+  between windows. Each is shrunk toward what this machine's own closed windows show:
+  omega from how far the dollars per percent at each tick of a closed window strayed from
+  its end, tau from the scatter of past allowances. The card's basis line says which is
+  assumed and which measured. Past windows come from the mod's own readings of closed
+  windows that reached half way and from rate-limit rejections in the last 14 days of
+  transcripts, each a window seen exactly full; a window seen both ways counts once.
+  Older windows count for less: a past 5-hour window loses half its weight every day, a
+  past week every 14 days, so the estimate follows a change of limits quickly. The card's
   "history weight" is the effective number of past windows behind the prior.
 
-How fast the allowance can be known after a change of limits:
+How fast the allowance can be known, with no past windows, from the coverage simulation
+in `tests/coverage.test.mjs` (scenario S1: steady requests of about $0.60 against a $650
+window). The first column holds once omega has been measured on 30 closed windows, the
+second with the assumed omega:
 
-| Window used | Range |
-|---|---|
-| ~1% | about a factor of four |
-| ~4% | ±25% |
-| ~8–10% | ±10% |
+| Window used | Range, spread measured | Range, spread assumed |
+|---|---|---|
+| 3% | ±21% | about a factor of two |
+| 10% | ±9% | ±39% |
+| 25% | ±5% | ±21% |
+| 50% | ±3% | ±11% |
+| 90% | ±1% | ±4% |
 
-On a 5-hour window that takes under an hour of work; on the week, about a day.
+Past windows narrow the early figures further. In the simulation the range holds the true
+allowance 89% to 96% of the time from 3% used on, when the rounding rule is known, and
+somewhat more often while it is not.
 
 Upgrading from 0.3.0 restarts the estimates once: the readings it kept cannot be attributed
 to a subscription. Upgrading from 0.4.0 drops the stored readings once: some paired a
-session's old percent with current dollars.
+session's old percent with current dollars. Upgrading from 0.5.0 drops them once more:
+they paired the percent with the dollars at the time of the scan. Rate-limit history is
+kept.
 
 ### Limits
 
 - Usage from other machines, or from claude.ai, on the same subscription is not counted,
   and makes the allowance look smaller than it is.
+- The model assumes the dollars per percent vary from request to request independently.
+  When the mix of work stays expensive or cheap for long stretches (say, one model for an
+  hour, then another), the early range is too narrow: in the simulation it holds the true
+  allowance about 85% of the time rather than 90%.
 - Model prices live in [`scripts/usage-cost.mjs`](usage-dollars/scripts/usage-cost.mjs).
   A model missing there is reported as unpriced, never guessed; add new models as they
   ship.
@@ -172,9 +199,15 @@ session's old percent with current dollars.
 | `hooks/card.tsx` | The window and report cards, their Markdown fallbacks, the status line |
 | `scripts/usage-cost.mjs` | Transcript scan, pricing, the profile, date labels (Node) |
 | `types/index.d.ts` | Type contract for the mod's session state |
-| `tests/*.test.ts` | Unit tests: `claude plugin test usage-dollars` |
+| `tests/*.test.ts` | Unit tests: `claude plugin test usage-dollars` (see below) |
 | `tests/helper.test.mjs` | Helper tests: `node --test usage-dollars/tests/helper.test.mjs` |
+| `tests/coverage.test.mjs` | Coverage of the 90% range in simulated windows: `node --test usage-dollars/tests/coverage.test.mjs` |
 | `tests/fixtures/` | Synthetic profiles and transcripts for the helper tests |
+
+`claude plugin test` and a `claude plugin validate` that knows every hook this mod uses
+need a recent Claude Code. The `claude` on `PATH` may be older than the build the desktop
+app bundles, under `%APPDATA%\Claude\claude-code\<version>\<build>\claude.exe` on Windows;
+run that one if `plugin test` is an unknown command.
 
 `node usage-dollars/scripts/usage-cost.mjs --check` sets each session's computed cost
 beside the cost Claude Code recorded for it.

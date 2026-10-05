@@ -4,8 +4,10 @@
    bridge-session records the desktop app writes).
 
    Usage:
-     node usage-cost.mjs --session <id> --window <name>,<sinceISO>,<resetISO> [--window ...]
-         Totals per window: used dollars, requests, per-model split, reset labels.
+     node usage-cost.mjs --session <id> --window <name>,<sinceISO>,<resetISO>[,<untilISO>] [--window ...]
+         Totals per window: used dollars up to <untilISO> (else up to now), requests,
+         per-model split, reset labels, and slackUsd: the dollars of other sessions'
+         requests in the 30 s up to then. The top-level pricesId names the price table.
      node usage-cost.mjs --session <id> --whoami
          The session's subscription and the signed-in profile, without a scan.
      node usage-cost.mjs --session <id> --history <days>
@@ -21,6 +23,7 @@
    Every mode but --check also takes --label <key>,<ISO> (any number of times), answered
    as local-time labels, and --profile-file <path> in place of the config file. */
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -52,6 +55,15 @@ const PRICES = {
 const PREFIXES = Object.keys(PRICES).sort((a, b) => b.length - a.length);
 const WEB_SEARCH_USD = 0.01;
 const FAST_MULTIPLIER = 2;
+const CACHE_5M_MULTIPLIER = 1.25;
+const CACHE_1H_MULTIPLIER = 2;
+/* Readings priced with another table are not comparable with this one's dollars. */
+const PRICES_ID = crypto.createHash("sha256")
+    .update(JSON.stringify({ PRICES, WEB_SEARCH_USD, FAST_MULTIPLIER, CACHE_5M_MULTIPLIER, CACHE_1H_MULTIPLIER }))
+    .digest("hex")
+    .slice(0, 12);
+/* Another session's request this close before a reading may or may not be in its percent. */
+const SLACK_MS = 30000;
 const DAY_MS = 24 * 3600000;
 const SPAN_MS = { five_hour: 5 * 3600000, seven_day: 7 * DAY_MS };
 
@@ -95,8 +107,8 @@ function costOf(model, u)
     let usd = ((u.input_tokens || 0) * inp
         + (u.output_tokens || 0) * out
         + (u.cache_read_input_tokens || 0) * read
-        + w5 * inp * 1.25
-        + w1 * inp * 2) / 1e6;
+        + w5 * inp * CACHE_5M_MULTIPLIER
+        + w1 * inp * CACHE_1H_MULTIPLIER) / 1e6;
     if (u.speed === "fast")
         usd *= FAST_MULTIPLIER;
     usd += ((u.server_tool_use && u.server_tool_use.web_search_requests) || 0) * WEB_SEARCH_USD;
@@ -348,9 +360,10 @@ function ownerOf(req, s, org, profileOrg)
     return null;
 }
 
-/* Requests with sinceMs <= ts <= untilMs. dayOf, when given, maps a request's time to a
-   per-day bucket that is credited alongside the total. */
-function tally(s, org, profileOrg, sinceMs, untilMs, dayOf)
+/* Requests with sinceMs <= ts <= untilMs, and only those `isIncluded` accepts when given.
+   dayOf, when given, maps a request's time to a per-day bucket that is credited alongside
+   the total. */
+function tally(s, org, profileOrg, sinceMs, untilMs, dayOf, isIncluded)
 {
     const out = {
         usd: 0,
@@ -364,7 +377,7 @@ function tally(s, org, profileOrg, sinceMs, untilMs, dayOf)
     const unpriced = new Set();
     for (const req of s.requests.values())
     {
-        if (req.ts < sinceMs || req.ts > untilMs)
+        if (req.ts < sinceMs || req.ts > untilMs || (isIncluded && !isIncluded(req)))
             continue;
         const usd = costOf(req.model, req.usage);
         if (usd === null)
@@ -443,19 +456,32 @@ function windows(profile)
     const started = Date.now();
     const specs = args("window").map(spec =>
     {
-        const [name, since, reset] = spec.split(",");
+        const [name, since, reset, until] = spec.split(",");
         const sinceMs = Date.parse(since);
-        if (!name || !Number.isFinite(sinceMs))
-            throw new Error("--window takes <name>,<sinceISO>,<resetISO>: " + spec);
-        return { name, sinceMs, resetMs: Date.parse(reset) };
+        const untilMs = until === undefined ? Infinity : Date.parse(until);
+        if (!name || !Number.isFinite(sinceMs) || Number.isNaN(untilMs))
+            throw new Error("--window takes <name>,<sinceISO>,<resetISO>[,<untilISO>]: " + spec);
+        return { name, sinceMs, resetMs: Date.parse(reset), untilMs };
     });
     if (!specs.length)
         throw new Error("at least one --window is required");
     const s = scan(Math.min(...specs.map(w => w.sinceMs)));
-    const { org, orgSource } = resolveOrg(s, args("session")[0], profile);
-    const out = { org, orgSource, windows: {}, files: s.fileCount, copiesIgnored: s.copies, ms: 0 };
+    const session = args("session")[0];
+    const { org, orgSource } = resolveOrg(s, session, profile);
+    const profileOrg = profile ? profile.org : null;
+    const out = { org, orgSource, pricesId: PRICES_ID, windows: {}, files: s.fileCount, copiesIgnored: s.copies, ms: 0 };
     for (const w of specs)
-        out.windows[w.name] = { since: new Date(w.sinceMs).toISOString(), ...tally(s, org, profile ? profile.org : null, w.sinceMs, Infinity), ...resetLabels(w.resetMs) };
+    {
+        /* A subagent's requests carry its parent's session, so they count as this session's. */
+        const slackUntil = Number.isFinite(w.untilMs) ? w.untilMs : started;
+        const slack = tally(s, org, profileOrg, slackUntil - SLACK_MS + 1, slackUntil, undefined, req => !req.sessions.has(session));
+        out.windows[w.name] = {
+            since: new Date(w.sinceMs).toISOString(),
+            ...tally(s, org, profileOrg, w.sinceMs, w.untilMs),
+            slackUsd: slack.usd,
+            ...resetLabels(w.resetMs)
+        };
+    }
     out.ms = Date.now() - started;
     return out;
 }

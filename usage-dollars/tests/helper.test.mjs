@@ -3,6 +3,8 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -11,6 +13,11 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const HELPER = path.join(HERE, "..", "scripts", "usage-cost.mjs");
 const FIXTURES = path.join(HERE, "fixtures");
 const CONFIG = path.join(FIXTURES, "config");
+/* Requests around 12:00:00: session-a's own at -5 s and its subagent's at -3 s; session-d,
+   same subscription, at -45 s, -10 s and +5 s; session-e, another subscription, at -5 s. */
+const SLACK_CONFIG = path.join(FIXTURES, "config-slack");
+const SLACK_WINDOW = "session,2026-10-04T11:00:00.000Z,2026-10-04T16:00:00.000Z";
+const SLACK_UNTIL = "2026-10-04T12:00:00.000Z";
 
 const ORG_A = "00000000-0000-4000-8000-000000000001";
 const ORG_B = "00000000-0000-4000-8000-000000000002";
@@ -38,9 +45,9 @@ const PROFILE_KEYS = [
 ];
 const RANGE = "2026-09-28T00:00:00.000Z,2026-10-06T00:00:00.000Z";
 
-function run(args, profile = "profile-max5x.json", config = CONFIG)
+function run(args, profile = "profile-max5x.json", config = CONFIG, helper = HELPER)
 {
-    const r = spawnSync(process.execPath, [HELPER, ...args, "--profile-file", path.join(FIXTURES, profile)], {
+    const r = spawnSync(process.execPath, [helper, ...args, "--profile-file", path.join(FIXTURES, profile)], {
         env: { ...process.env, CLAUDE_CONFIG_DIR: config },
         encoding: "utf8"
     });
@@ -183,6 +190,47 @@ test("--label returns one label per key", () =>
     assert.deepEqual(Object.keys(out.labels).sort(), ["1791021600000", "now"]);
     for (const label of Object.values(out.labels))
         assert.match(label, /^\w{3} \d{1,2} \w{3}, \d{2}:\d{2}$/);
+});
+
+test("a window's untilISO leaves out later requests", () =>
+{
+    const until = run(["--session", "session-a", "--window", `${SLACK_WINDOW},${SLACK_UNTIL}`], "profile-max5x.json", SLACK_CONFIG).json;
+    assert.ok(near(until.windows.session.usd, 23), `usd ${until.windows.session.usd}`);
+    assert.equal(until.windows.session.requests, 4);
+    const now = run(["--session", "session-a", "--window", SLACK_WINDOW], "profile-max5x.json", SLACK_CONFIG).json;
+    assert.ok(near(now.windows.session.usd, 31), `usd ${now.windows.session.usd}`);
+    const bad = run(["--session", "session-a", "--window", `${SLACK_WINDOW},not-a-date`], "profile-max5x.json", SLACK_CONFIG);
+    assert.equal(bad.status, 2);
+});
+
+test("slackUsd is other sessions' dollars of this subscription in the 30 s up to untilISO", () =>
+{
+    const mine = run(["--session", "session-a", "--window", `${SLACK_WINDOW},${SLACK_UNTIL}`], "profile-max5x.json", SLACK_CONFIG).json;
+    assert.ok(near(mine.windows.session.slackUsd, 2), `slack ${mine.windows.session.slackUsd}`);
+    const other = run(["--session", "session-d", "--window", `${SLACK_WINDOW},${SLACK_UNTIL}`], "profile-max5x.json", SLACK_CONFIG).json;
+    assert.ok(near(other.windows.session.slackUsd, 17), `slack ${other.windows.session.slackUsd}`);
+});
+
+test("pricesId is stable, and changes with a price", () =>
+{
+    const args = ["--session", "session-a", "--window", SLACK_WINDOW];
+    const first = run(args, "profile-max5x.json", SLACK_CONFIG).json.pricesId;
+    assert.match(first, /^[0-9a-f]{12}$/);
+    assert.equal(run(args, "profile-max5x.json", SLACK_CONFIG).json.pricesId, first);
+    const source = fs.readFileSync(HELPER, "utf8");
+    const repriced = source.replace('"claude-haiku-4-5": [1, 5, 0.10]', '"claude-haiku-4-5": [1, 5, 0.11]');
+    assert.notEqual(repriced, source);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "usage-dollars-"));
+    try
+    {
+        const copy = path.join(dir, "usage-cost.mjs");
+        fs.writeFileSync(copy, repriced);
+        assert.notEqual(run(args, "profile-max5x.json", SLACK_CONFIG, copy).json.pricesId, first);
+    }
+    finally
+    {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });
 
 test("the promotion fixture yields its limit and end", () =>

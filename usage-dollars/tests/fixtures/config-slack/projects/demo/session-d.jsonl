@@ -1,0 +1,4 @@
+{"type":"bridge-session","sessionId":"session-d","bridgeSessionId":"bridge-session-d","lastSequenceNum":1,"ownerAccountUuid":"00000000-0000-4000-8000-0000000000aa","ownerOrganizationUuid":"00000000-0000-4000-8000-000000000001"}
+{"type":"assistant","sessionId":"session-d","timestamp":"2026-10-04T11:59:15.000Z","requestId":"d1","message":{"id":"msg-d1","model":"claude-haiku-4-5","usage":{"input_tokens":4000000,"output_tokens":0}}}
+{"type":"assistant","sessionId":"session-d","timestamp":"2026-10-04T11:59:50.000Z","requestId":"d2","message":{"id":"msg-d2","model":"claude-haiku-4-5","usage":{"input_tokens":2000000,"output_tokens":0}}}
+{"type":"assistant","sessionId":"session-d","timestamp":"2026-10-04T12:00:05.000Z","requestId":"d3","message":{"id":"msg-d3","model":"claude-haiku-4-5","usage":{"input_tokens":8000000,"output_tokens":0}}}

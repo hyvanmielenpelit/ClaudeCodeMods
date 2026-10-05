@@ -10,8 +10,8 @@ import type { SessionRateLimit } from 'claude-code'
 
 import type { ModelSpend, PlanReport, SpendReport, UsageReport, WindowReport } from '../types'
 import { money, statusLine } from './card'
-import { estimate, inferRounding, observed, record, regimeView, resolutionOf } from './estimate'
-import type { Estimate, PastPoint, WindowReadings } from './estimate'
+import { calibrateOmega, estimate, inferRounding, pastPoints, record, regimeView, resolutionOf } from './estimate'
+import type { Estimate, WindowReadings } from './estimate'
 import { activePromotions, addRegimes, currentRegime, observePlan, observePromotions, planLabel, regimeStart, startOver, undoStartOver } from './plan'
 import type { Kind, Ledger, NoticeDraft, PlanEntry, Profile, Promotions, Regime, Regimes } from './plan'
 
@@ -26,8 +26,13 @@ const HISTORY_REFRESH_MS = 6 * HOUR_MS
 const NOTICE_SHOWN_MS = 7 * DAY_MS
 const STALE_PROFILE_MS = 7 * DAY_MS
 const KEPT_NOTICES = 20
-const SCHEMA = 3
+/* Above this share of a window's requests going to unpriced models, its dollars no longer
+   track the limit. */
+const MAX_UNPRICED_SHARE = 0.02
+const SCHEMA = 4
 const NONE = 'none'
+/* The suffix of a window's second tally, up to the moment its percent was received. */
+const AT_READ = '@read'
 
 const SCHEMA_KEY = 'schema'
 const LIMITS_KEY = 'limits'
@@ -98,6 +103,8 @@ type WindowTally = {
   unattributedUsd: number
   unpricedRequests: number
   unpricedModels: string[]
+  /* Other sessions' dollars just before the tally's end, which its percent may lack. */
+  slackUsd?: number
   resetLabel?: string
   resetLong?: string
   resetIn?: string
@@ -111,7 +118,7 @@ type HelperBase = {
   error?: string
 }
 
-type WindowsOutput = HelperBase & { windows?: Record<string, WindowTally>; files: number; ms: number }
+type WindowsOutput = HelperBase & { windows?: Record<string, WindowTally>; pricesId?: string; files: number; ms: number }
 
 type ReportOutput = HelperBase & {
   usd: number
@@ -133,6 +140,7 @@ type WindowState = {
   resetsAt: string
   tally: WindowTally
   estimate?: Estimate
+  isUnpriced: boolean
   sinceResetLabel?: string
   percent?: number
   percentAt?: number
@@ -160,8 +168,9 @@ let running: Promise<Summary | undefined> | undefined
 /* When this session last received its percents; their age decides between them and the
    ones other sessions stored. */
 let lastFreshAt: number | undefined
-/* A fresh measure that arrived while another ran; the latest wins. */
-let pendingFresh: { host: Host; limits?: readonly SessionRateLimit[] } | undefined
+/* A fresh measure that arrived while another ran, with the time its percents arrived;
+   the latest wins. */
+let pendingFresh: { host: Host; limits?: readonly SessionRateLimit[]; receivedAt?: number } | undefined
 
 const subscriptionOf = (org: string | null | undefined) => org ?? NONE
 
@@ -196,15 +205,17 @@ async function runHelper<T extends HelperBase>(host: Host, extra: readonly strin
    attributed, so they are dropped once and the estimates start again.
    Before schema 3 any session paired its own last percent, however old, with the dollars
    of the moment and stored the pair; nothing tells those readings or limits from sound
-   ones, so both are dropped once more. Schema-2 history comes from rate-limit rejections
-   in the transcripts, not from percents, and is kept. */
+   ones, so both are dropped once more. Schema-3 readings paired the percent with the
+   dollars at the time of the scan and carry no slack or price table, so they are dropped
+   once again. History comes from rate-limit rejections in the transcripts, not from
+   percents, and is kept from schema 2 on. */
 async function migrate(host: Host) {
   if (isMigrated) return
   const was = await host.get(SCHEMA_KEY)
   if (was !== SCHEMA) {
     await host.delete(LIMITS_KEY)
     await host.delete(READINGS_KEY)
-    if (was !== 2) await host.delete(HISTORY_KEY)
+    if (was !== 2 && was !== 3) await host.delete(HISTORY_KEY)
     await host.set(SCHEMA_KEY, SCHEMA)
   }
   isMigrated = true
@@ -317,22 +328,31 @@ function isStraddling(r: WindowReadings & { org: string }, regimes: Regimes) {
   )
 }
 
-function basisOf(e: Estimate | undefined, sinceResetLabel: string | undefined) {
+function basisOf(e: Estimate | undefined, isUnpriced: boolean, sinceResetLabel: string | undefined) {
   const reset = sinceResetLabel ? ` · since reset ${sinceResetLabel}` : ''
+  if (isUnpriced) return `Unpriced models in use: no estimate${reset}.`
   if (!e) return `No estimate yet: the limit has not reported a usable reading for this window${reset}.`
-  const readings = `${e.readings} percent level${e.readings === 1 ? '' : 's'} read this window`
-  const mix = e.isMixErrorAssumed ? 'price-mix error assumed at 10%' : `price-mix error from ${e.pastWindows} past windows`
-  const n = e.droppedReadings
-  const dropped = n > 0 ? ` · ${n} conflicting level${n === 1 ? '' : 's'} set aside` : ''
-  return `${readings} · ${mix} · history weight ${e.pastWeight}${reset}${dropped}`
+  const readings = `${e.readings} percent level${e.readings === 1 ? '' : 's'} read`
+  const within = `within-window spread ${e.isWithinSpreadAssumed ? 'assumed' : 'measured'}`
+  const between = e.isSpreadAssumed
+    ? 'between-window spread assumed'
+    : `between-window spread from ${e.pastWindows} past window${e.pastWindows === 1 ? '' : 's'}`
+  return `${readings} · ${within} · ${between} · history weight ${e.pastWeight}${reset}`
 }
 
-/* isFresh: `given` holds percents this session has just received, so they and the dollars
-   scanned now describe the same moment. Only such a measure records readings or shares
-   its limits. */
-async function measure(host: Host, given: readonly SessionRateLimit[] | undefined, isFresh: boolean): Promise<Summary | undefined> {
+const isUnpricedTally = (t: WindowTally) => t.unpricedRequests > MAX_UNPRICED_SHARE * (t.requests + t.unpricedRequests)
+
+/* isFresh: `given` holds percents this session received at receivedAt, so they and the
+   dollars counted up to then describe the same moment. Only such a measure records
+   readings or shares its limits. */
+async function measure(
+  host: Host,
+  given: readonly SessionRateLimit[] | undefined,
+  isFresh: boolean,
+  receivedAt: number | undefined,
+): Promise<Summary | undefined> {
   const now = await host.now()
-  const readAt = now
+  const readAt = isFresh && receivedAt !== undefined ? receivedAt : now
   const live = given ?? (await host.rateLimits())
   if (isFresh) lastFreshAt = readAt
   let subscription = await resolveSubscription(host)
@@ -357,6 +377,7 @@ async function measure(host: Host, given: readonly SessionRateLimit[] | undefine
     for (const { w, limit } of active) {
       const since = new Date(Date.parse(limit.resetsAt) - w.spanMs).toISOString()
       extra.push('--window', `${w.name},${since},${limit.resetsAt}`)
+      if (isFresh) extra.push('--window', `${w.name}${AT_READ},${since},${limit.resetsAt},${new Date(readAt).toISOString()}`)
     }
     extra.push('--window', `last24h,${new Date(now - DAY_MS).toISOString()},${new Date(now).toISOString()}`)
     extra.push(...labelArgs(regimes, plans, subscription, now))
@@ -395,18 +416,22 @@ async function measure(host: Host, given: readonly SessionRateLimit[] | undefine
 
   /* A guessed subscription must not write readings; with none at all every request is
      counted, as on a machine without bridge-session records. A reading takes its percent
-     from `given` alone, and only for the window the dollars were scanned for. */
+     from `given` alone, and only for the window the dollars were scanned for; its dollars
+     end where the percent was received. Readings priced with another table are dropped. */
   const mayRecord = out.org === null || out.org === undefined || out.orgSource === 'session' || out.orgSource === 'profile'
-  const readings = ((await host.get(READINGS_KEY)) ?? {}) as StoredReadings
+  const pricesId = out.pricesId
+  const readings = Object.fromEntries(
+    Object.entries(((await host.get(READINGS_KEY)) ?? {}) as StoredReadings).filter(([, r]) => r.pricesId === pricesId),
+  ) as StoredReadings
   if (mayRecord && isFresh && given !== undefined)
     for (const { w, limit } of active) {
-      const tally = out.windows[w.name]
+      const tally = out.windows[`${w.name}${AT_READ}`]
       const fresh = given.find(l => l.kind === w.kind && l.resetsAt)
-      if (!tally || !fresh) continue
+      if (!tally || !fresh || isUnpricedTally(tally)) continue
       const key = windowKey(subscription, w.kind, limit.resetsAt)
       if (windowKey(subscription, w.kind, fresh.resetsAt!) !== key) continue
-      const was = readings[key] ?? { kind: w.kind, resetsAt: limit.resetsAt, byPct: {}, org: subscription }
-      readings[key] = { ...record(was, fresh.percentUsed, tally.usd, readAt), org: subscription }
+      const was = readings[key] ?? { kind: w.kind, resetsAt: limit.resetsAt, byPct: {}, org: subscription, pricesId }
+      readings[key] = { ...record(was, fresh.percentUsed, tally.usd, readAt, tally.slackUsd ?? 0), org: subscription, pricesId }
     }
   const kept = Object.fromEntries(
     Object.entries(readings).filter(([, r]) => Date.parse(r.resetsAt) > now - READINGS_KEPT_MS),
@@ -448,26 +473,28 @@ async function measure(host: Host, given: readonly SessionRateLimit[] | undefine
     if (!tally) continue
     const startedAt = regimeStart(regimes, subscription, w.kind)
     const regime = currentRegime(regimes, subscription, w.kind)
-    const past: PastPoint[] = [
-      ...all
-        .filter(r => r.org === subscription && r.kind === w.kind && Date.parse(r.resetsAt) <= now && Date.parse(r.resetsAt) >= startedAt)
-        .map(r => ({ usd: observed(regimeView(r, startedAt), resolution, rounding), at: Date.parse(r.resetsAt) })),
-      ...observations
-        .filter(o => o.kind === w.kind && Date.parse(o.resetsAt) > now - HISTORY_DAYS * DAY_MS)
-        .map(o => ({ usd: o.usd, at: Date.parse(o.at) })),
-    ].filter((p): p is PastPoint => p.usd !== undefined && p.at >= startedAt)
+    /* Closed windows of this subscription and regime: one past point each, and the
+       crossings that measure the within-window spread. */
+    const closed = all
+      .filter(r => r.org === subscription && r.kind === w.kind && Date.parse(r.resetsAt) <= now && Date.parse(r.resetsAt) >= startedAt)
+      .map(r => regimeView(r, startedAt))
+    const rejections = observations.filter(o => Date.parse(o.resetsAt) > now - HISTORY_DAYS * DAY_MS)
+    const past = pastPoints(closed, rejections, w.kind, resolution, rounding).filter(p => p.at >= startedAt)
     const key = windowKey(subscription, w.kind, limit.resetsAt)
     const current = kept[key]
-    const e = current
-      ? estimate(regimeView(current, startedAt), tally.usd, {
-          resolution,
-          rounding,
-          past,
-          kind: w.kind,
-          now,
-          livePercent: limit.observedAt !== undefined && now - limit.observedAt <= FRESH_MS ? limit.percentUsed : undefined,
-        })
-      : undefined
+    const isUnpriced = isUnpricedTally(tally)
+    const e =
+      current && !isUnpriced
+        ? estimate(regimeView(current, startedAt), tally.usd, {
+            resolution,
+            rounding,
+            past,
+            kind: w.kind,
+            now,
+            livePercent: limit.observedAt !== undefined && now - limit.observedAt <= FRESH_MS ? limit.percentUsed : undefined,
+            spread: calibrateOmega(closed, w.kind, now, resolution, rounding),
+          })
+        : undefined
     if (e?.isPriorContradicted) drafts.push({ id: `inferred:${key}`, kind: 'inferred', text: INFERRED_TEXT })
     windows.push({
       title: w.title,
@@ -475,6 +502,7 @@ async function measure(host: Host, given: readonly SessionRateLimit[] | undefine
       resetsAt: limit.resetsAt,
       tally,
       estimate: e,
+      isUnpriced,
       sinceResetLabel: regime?.reason === 'manual' ? labels[String(regime.startedAt)] : undefined,
       percent: limit.percentUsed,
       percentAt: limit.percentUsed !== undefined ? limit.observedAt : undefined,
@@ -521,14 +549,14 @@ export function statusOf(summary: Pick<Summary, 'windows'>, isPlanUnseen: boolea
 
 /* One scan at a time, at most once a minute unless forced or fresh. A fresh call that
    meets a running scan is queued and runs, forced, once that scan settles. */
-export function refresh(host: Host, limits?: readonly SessionRateLimit[], isForced = false, isFresh = false) {
+export function refresh(host: Host, limits?: readonly SessionRateLimit[], isForced = false, isFresh = false, receivedAt?: number) {
   if (running) {
-    if (isFresh) pendingFresh = { host, limits }
+    if (isFresh) pendingFresh = { host, limits, receivedAt }
     return running
   }
   if (!isForced && !isFresh && Date.now() - lastRunAt < MIN_GAP_MS) return Promise.resolve(last)
   lastRunAt = Date.now()
-  running = measure(host, limits, isFresh)
+  running = measure(host, limits, isFresh, receivedAt)
     .then(summary => (last = summary ?? last))
     .catch(error => {
       host.log(`usage-dollars: ${String(error)}`)
@@ -538,7 +566,7 @@ export function refresh(host: Host, limits?: readonly SessionRateLimit[], isForc
       running = undefined
       const queued = pendingFresh
       pendingFresh = undefined
-      if (queued) void refresh(queued.host, queued.limits, true, true)
+      if (queued) void refresh(queued.host, queued.limits, true, true, queued.receivedAt)
     })
   return running
 }
@@ -622,9 +650,10 @@ export function toReport(summary: Summary, now: number): UsageReport {
     nextTick: s.estimate?.nextTick,
     pastWeight: s.estimate?.pastWeight,
     isPriorContradicted: s.estimate?.isPriorContradicted,
+    isSpreadAssumed: s.estimate?.isSpreadAssumed,
     percent: s.percent,
     percentAgeMinutes: s.percentAt !== undefined ? Math.max(0, Math.round((now - s.percentAt) / MINUTE_MS)) : undefined,
-    basis: basisOf(s.estimate, s.sinceResetLabel),
+    basis: basisOf(s.estimate, s.isUnpriced, s.sinceResetLabel),
   }))
   const widest = summary.windows[summary.windows.length - 1]
   const byModel: ModelSpend[] = Object.entries(widest?.tally.byModel ?? {})

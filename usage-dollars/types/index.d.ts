@@ -17,6 +17,8 @@ export type WindowReport = {
   nextTick?: RangeReport
   pastWeight?: number
   isPriorContradicted?: boolean
+  /** The spread of allowances between windows is assumed: under 3 effective past windows. */
+  isSpreadAssumed?: boolean
   /** The percent the limit reported, the freshest any session received. */
   percent?: number
   /** Minutes since that percent was received. */
