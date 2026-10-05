@@ -17,6 +17,10 @@ export type WindowReport = {
   nextTick?: RangeReport
   pastWeight?: number
   isPriorContradicted?: boolean
+  /** The percent the limit reported, the freshest any session received. */
+  percent?: number
+  /** Minutes since that percent was received. */
+  percentAgeMinutes?: number
   basis: string
 }
 

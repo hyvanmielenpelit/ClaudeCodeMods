@@ -36,8 +36,8 @@ async function toastNotices($: EngineInterface) {
   for (const text of await takeToasts(hostOf($))) $.ui.toast(text, { timeoutMs: 10000 })
 }
 
-function measureThen($: EngineInterface, limits?: readonly SessionRateLimit[], isForced = false) {
-  return refresh(hostOf($), limits, isForced).then(async summary => {
+function measureThen($: EngineInterface, limits?: readonly SessionRateLimit[], isForced = false, isFresh = false) {
+  return refresh(hostOf($), limits, isForced, isFresh).then(async summary => {
     await toastNotices($)
     return summary
   })
@@ -82,8 +82,11 @@ export const register: Register = on => {
     return next(e)
   })
 
+  /* Only here does the session hold a percent it has just received: a billed response, or
+     a window that moved a whole point. */
   on('session.measure', async ($, e, next) => {
-    void measureThen($, e.rateLimits, e.changed.includes('rateLimits'))
+    const isFresh = e.changed.includes('cost') || e.changed.includes('rateLimits')
+    void measureThen($, e.rateLimits, e.changed.includes('rateLimits'), isFresh)
     return next(e)
   })
 
@@ -95,7 +98,7 @@ export const register: Register = on => {
       if (!summary) return { text: 'No usage figures yet: they appear after the first reply in this session.' }
       await markNoticesSeen(hostOf($))
       $.ui.status(statusOf(summary, false))
-      const report = toReport(summary)
+      const report = toReport(summary, await $.clock.now())
       return { text: markdownWindows(report, await keep($, report)) }
     }
 

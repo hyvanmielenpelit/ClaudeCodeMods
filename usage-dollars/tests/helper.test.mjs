@@ -120,18 +120,35 @@ test("--report totals match the days and the models, and leave out other subscri
 {
     const out = run(["--session", "session-a", "--report", RANGE]).json;
     assert.equal(out.org, ORG_A);
-    assert.ok(near(out.usd, 7), `usd ${out.usd}`);
-    assert.equal(out.requests, 3);
+    assert.ok(near(out.usd, 8), `usd ${out.usd}`);
+    assert.equal(out.requests, 4);
     assert.ok(near(out.usd, sum(out.byDay.map(d => d.usd))));
     assert.ok(near(out.usd, sum(Object.values(out.byModel).map(m => m.usd))));
     assert.equal(out.requests, sum(out.byDay.map(d => d.requests)));
     assert.ok(near(out.otherSubscriptionsUsd, 4));
-    assert.ok(near(out.unattributedUsd, 1));
+    assert.ok(near(out.unattributedUsd, 0));
     assert.ok(out.byDay.length >= 8);
     for (const d of out.byDay)
         assert.match(d.date, /^\d{4}-\d{2}-\d{2}$/);
     assert.equal(typeof out.fromLabel, "string");
     assert.equal(typeof out.toLabel, "string");
+});
+
+test("without a profile, a session with no record stays unattributed", () =>
+{
+    const out = run(["--session", "session-a", "--report", RANGE], "missing.json").json;
+    assert.equal(out.org, ORG_A);
+    assert.ok(near(out.usd, 7), `usd ${out.usd}`);
+    assert.ok(near(out.unattributedUsd, 1));
+});
+
+test("a session with no record bills the signed-in subscription, even when it is another", () =>
+{
+    const out = run(["--session", "session-a", "--report", RANGE], "profile-other-org.json").json;
+    assert.equal(out.org, ORG_A);
+    assert.ok(near(out.usd, 7), `usd ${out.usd}`);
+    assert.ok(near(out.otherSubscriptionsUsd, 5));
+    assert.ok(near(out.unattributedUsd, 0));
 });
 
 test("--report-local covers whole local days, empty ones included", () =>
@@ -140,7 +157,7 @@ test("--report-local covers whole local days, empty ones included", () =>
     assert.equal(out.byDay.length, 7);
     assert.equal(out.byDay[0].date, "2026-09-30");
     assert.equal(out.byDay[6].date, "2026-10-06");
-    assert.ok(near(out.usd, 7));
+    assert.ok(near(out.usd, 8));
     assert.ok(near(out.usd, sum(out.byDay.map(d => d.usd))));
 });
 

@@ -9,7 +9,10 @@
    as API prices match the limit's own weighting, so the bounds are widened by that mix
    error: the age-weighted spread of past windows' allowances when there is enough of
    them, else an assumed 10%. Past windows also give a prior that the current bounds are
-   intersected with, unless the two contradict each other. */
+   intersected with, unless the two contradict each other.
+
+   Readings that contradict the rest are set aside rather than averaged: the bounds come
+   from the largest set of percent levels that agree, the newest set on a tie. */
 
 import type { Confidence } from '../types'
 
@@ -28,6 +31,7 @@ export type Estimate = {
   allowance: RangeEstimate
   left: RangeEstimate
   readings: number
+  droppedReadings: number
   pastWindows: number
   pastWeight: number
   isMixErrorAssumed: boolean
@@ -102,9 +106,42 @@ export function bounds(w: WindowReadings, resolution: number, rounding: Rounding
   return { low, high }
 }
 
-/* A closed window whose bounds are tight enough stands as one observed allowance. */
+/* The bounds of the largest set of percent levels whose intervals share a point; on a tie,
+   the set whose readings are newest by the sum of their maxAt. A level that contradicts
+   itself is dropped first. With none left, the plain bounds of all levels, kept 0. */
+export function consistentBounds(w: WindowReadings, resolution: number, rounding: Rounding) {
+  const levels = Object.entries(w.byPct)
+  const intervals: { lo: number; hi: number; at: number }[] = []
+  for (const [key, bucket] of levels) {
+    const { lower, upper } = shareOf(Number(key), resolution, rounding)
+    const lo = bucket.maxUsd / (upper / 100)
+    const hi = lower > 0 ? bucket.minUsd / (lower / 100) : Infinity
+    if (lo > hi * (1 + 1e-9)) continue
+    intervals.push({ lo, hi, at: bucket.maxAt })
+  }
+  if (intervals.length === 0) return { ...bounds(w, resolution, rounding), kept: 0, dropped: levels.length }
+
+  /* Every largest agreeing set is the set covering some interval's lower end. */
+  let best: typeof intervals = []
+  let bestAt = -Infinity
+  for (const { lo: x } of intervals) {
+    const covering = intervals.filter(i => i.lo <= x && x <= i.hi * (1 + 1e-9))
+    const at = covering.reduce((sum, i) => sum + i.at, 0)
+    if (covering.length > best.length || (covering.length === best.length && at > bestAt)) {
+      best = covering
+      bestAt = at
+    }
+  }
+  const low = Math.max(...best.map(i => i.lo))
+  const high = Math.min(...best.map(i => i.hi))
+  return { low, high, kept: best.length, dropped: levels.length - best.length }
+}
+
+/* A closed window whose bounds are tight enough stands as one observed allowance; one with
+   a conflicting level does not. */
 export function observed(w: WindowReadings, resolution: number, rounding: Rounding) {
-  const { low, high } = bounds(w, resolution, rounding)
+  const { low, high, dropped } = consistentBounds(w, resolution, rounding)
+  if (dropped > 0) return undefined
   return low > 0 && Number.isFinite(high) && high / low <= MAX_HISTORY_RATIO ? Math.sqrt(low * high) : undefined
 }
 
@@ -183,12 +220,13 @@ function nextTickOf(a: RangeEstimate, usedUsd: number, pct: number, resolution: 
 
 export function estimate(w: WindowReadings, usedUsd: number, options: EstimateOptions): Estimate | undefined {
   const { resolution, rounding, past, kind, now, livePercent } = options
-  let { low, high } = bounds(w, resolution, rounding)
+  const consistent = consistentBounds(w, resolution, rounding)
+  let { low, high } = consistent
   const p = prior(past, kind, now)
   let mix = p.mix
 
   if (low > high) {
-    /* Readings that contradict each other are mix error showing; meet in the middle. */
+    /* Every level contradicts itself: mix error showing; meet in the middle. */
     mix = Math.max(mix, Math.log(low / high) / 2)
     low = high = Math.sqrt(low * high)
   }
@@ -216,6 +254,7 @@ export function estimate(w: WindowReadings, usedUsd: number, options: EstimateOp
     allowance,
     left: { value: value - usedUsd, low: lo - usedUsd, high: hi - usedUsd },
     readings: Object.keys(w.byPct).length,
+    droppedReadings: consistent.kept > 0 ? consistent.dropped : 0,
     pastWindows: p.points,
     pastWeight: Math.round(p.nEff * 10) / 10,
     isMixErrorAssumed: p.isMixErrorAssumed,

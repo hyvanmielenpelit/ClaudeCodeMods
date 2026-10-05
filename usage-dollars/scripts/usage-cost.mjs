@@ -327,18 +327,21 @@ function resolveOrg(s, session, profile)
     return { org: orgs[0] || null, orgSource: orgs[0] ? "most recent" : null };
 }
 
-/* With no bridge-session record anywhere (a machine without the desktop app), nothing
-   tells subscriptions apart, so every request is the resolved subscription's. */
-function ownerOfSession(session, s, org)
+/* A session with a bridge-session record bills the subscription the record names. With no
+   record anywhere (a machine without the desktop app), nothing tells subscriptions apart,
+   so every request is the resolved subscription's. Otherwise a session with no record, a
+   terminal session, bills the signed-in subscription, and stays unattributed without a
+   profile. */
+function ownerOfSession(session, s, org, profileOrg)
 {
-    return s.hasRecords ? s.orgBySession[session] || null : org;
+    return s.orgBySession[session] || (s.hasRecords ? profileOrg || null : org);
 }
 
-function ownerOf(req, s, org)
+function ownerOf(req, s, org, profileOrg)
 {
     for (const session of req.sessions)
     {
-        const owner = ownerOfSession(session, s, org);
+        const owner = ownerOfSession(session, s, org, profileOrg);
         if (owner)
             return owner;
     }
@@ -347,7 +350,7 @@ function ownerOf(req, s, org)
 
 /* Requests with sinceMs <= ts <= untilMs. dayOf, when given, maps a request's time to a
    per-day bucket that is credited alongside the total. */
-function tally(s, org, sinceMs, untilMs, dayOf)
+function tally(s, org, profileOrg, sinceMs, untilMs, dayOf)
 {
     const out = {
         usd: 0,
@@ -370,7 +373,7 @@ function tally(s, org, sinceMs, untilMs, dayOf)
             unpriced.add(req.model);
             continue;
         }
-        const owner = ownerOf(req, s, org);
+        const owner = ownerOf(req, s, org, profileOrg);
         if (!owner && org)
         {
             out.unattributedUsd += usd;
@@ -452,7 +455,7 @@ function windows(profile)
     const { org, orgSource } = resolveOrg(s, args("session")[0], profile);
     const out = { org, orgSource, windows: {}, files: s.fileCount, copiesIgnored: s.copies, ms: 0 };
     for (const w of specs)
-        out.windows[w.name] = { since: new Date(w.sinceMs).toISOString(), ...tally(s, org, w.sinceMs, Infinity), ...resetLabels(w.resetMs) };
+        out.windows[w.name] = { since: new Date(w.sinceMs).toISOString(), ...tally(s, org, profile ? profile.org : null, w.sinceMs, Infinity), ...resetLabels(w.resetMs) };
     out.ms = Date.now() - started;
     return out;
 }
@@ -496,10 +499,11 @@ function history(profile)
     const started = Date.now();
     const s = scan(Date.now() - days * DAY_MS - SPAN_MS.seven_day);
     const { org, orgSource } = resolveOrg(s, args("session")[0], profile);
+    const profileOrg = profile ? profile.org : null;
     const first = new Map();
     for (const r of s.rejections)
     {
-        if (org && ownerOfSession(r.session, s, org) !== org)
+        if (org && ownerOfSession(r.session, s, org, profileOrg) !== org)
             continue;
         const key = r.kind + ":" + r.resetsAt;
         if (!first.has(key) || r.at < first.get(key).at)
@@ -508,7 +512,7 @@ function history(profile)
     const observations = [];
     for (const r of first.values())
     {
-        const t = tally(s, org, r.resetsAt - SPAN_MS[r.kind], r.at);
+        const t = tally(s, org, profileOrg, r.resetsAt - SPAN_MS[r.kind], r.at);
         if (t.usd > 0)
             observations.push({ kind: r.kind, resetsAt: new Date(r.resetsAt).toISOString(), at: new Date(r.at).toISOString(), usd: t.usd });
     }
@@ -578,7 +582,7 @@ function report(profile)
         byDay.push(bucket);
         days[bucket.date] = bucket;
     }
-    const t = tally(s, org, sinceMs, untilMs - 1, ts => days[localDate(ts)]);
+    const t = tally(s, org, profile ? profile.org : null, sinceMs, untilMs - 1, ts => days[localDate(ts)]);
     const out = {
         org,
         orgSource,

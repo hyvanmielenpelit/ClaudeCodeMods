@@ -19,13 +19,14 @@ const MINUTE_MS = 60 * 1000
 const HOUR_MS = 60 * MINUTE_MS
 const DAY_MS = 24 * HOUR_MS
 const MIN_GAP_MS = MINUTE_MS
+const FRESH_MS = 5 * MINUTE_MS
 const READINGS_KEPT_MS = 28 * DAY_MS
 const HISTORY_DAYS = 14
 const HISTORY_REFRESH_MS = 6 * HOUR_MS
 const NOTICE_SHOWN_MS = 7 * DAY_MS
 const STALE_PROFILE_MS = 7 * DAY_MS
 const KEPT_NOTICES = 20
-const SCHEMA = 2
+const SCHEMA = 3
 const NONE = 'none'
 
 const SCHEMA_KEY = 'schema'
@@ -65,9 +66,13 @@ export type Host = {
 
 type OrgSource = 'session' | 'profile' | 'most recent'
 
-type Limit = { percentUsed?: number; resetsAt: string; isLive: boolean }
+/* observedAt: when a session last received this percent from the API; absent for a reset
+   rolled forward without one. */
+type Limit = { percentUsed?: number; resetsAt: string; observedAt?: number }
 
-type StoredLimits = Record<string, Record<string, { percentUsed?: number; resetsAt: string }>>
+type StoredLimit = { percentUsed?: number; resetsAt: string; observedAt: number }
+
+type StoredLimits = Record<string, Record<string, StoredLimit>>
 
 type StoredReadings = Record<string, WindowReadings & { org: string }>
 
@@ -129,6 +134,8 @@ type WindowState = {
   tally: WindowTally
   estimate?: Estimate
   sinceResetLabel?: string
+  percent?: number
+  percentAt?: number
 }
 
 export type Summary = {
@@ -150,6 +157,11 @@ let isMigrated = false
 let last: Summary | undefined
 let lastRunAt = 0
 let running: Promise<Summary | undefined> | undefined
+/* When this session last received its percents; their age decides between them and the
+   ones other sessions stored. */
+let lastFreshAt: number | undefined
+/* A fresh measure that arrived while another ran; the latest wins. */
+let pendingFresh: { host: Host; limits?: readonly SessionRateLimit[] } | undefined
 
 const subscriptionOf = (org: string | null | undefined) => org ?? NONE
 
@@ -181,13 +193,18 @@ async function runHelper<T extends HelperBase>(host: Host, extra: readonly strin
 }
 
 /* v0.3.0 kept limits, readings and history without a subscription; they cannot be
-   attributed, so they are dropped once and the estimates start again. */
+   attributed, so they are dropped once and the estimates start again.
+   Before schema 3 any session paired its own last percent, however old, with the dollars
+   of the moment and stored the pair; nothing tells those readings or limits from sound
+   ones, so both are dropped once more. Schema-2 history comes from rate-limit rejections
+   in the transcripts, not from percents, and is kept. */
 async function migrate(host: Host) {
   if (isMigrated) return
-  if ((await host.get(SCHEMA_KEY)) !== SCHEMA) {
+  const was = await host.get(SCHEMA_KEY)
+  if (was !== SCHEMA) {
     await host.delete(LIMITS_KEY)
     await host.delete(READINGS_KEY)
-    await host.delete(HISTORY_KEY)
+    if (was !== 2) await host.delete(HISTORY_KEY)
     await host.set(SCHEMA_KEY, SCHEMA)
   }
   isMigrated = true
@@ -202,17 +219,27 @@ export async function resolveSubscription(host: Host) {
   return subscriptionOf(out?.org)
 }
 
-/* The limit as the API reported it now, else as last stored for the subscription: a
-   7-day window rolls forward a week at a time, a 5-hour one only holds until its reset. */
-function limitOf(kind: Kind, live: readonly SessionRateLimit[], kept: { percentUsed?: number; resetsAt: string } | undefined, now: number) {
-  const found = live.find(l => l.kind === kind)
-  if (found?.resetsAt) return { percentUsed: found.percentUsed, resetsAt: found.resetsAt, isLive: true } as Limit
+/* The limit as last stored for the subscription: a 7-day window rolls forward a week at a
+   time, without a percent; a 5-hour one only holds until its reset. */
+function storedLimitOf(kind: Kind, kept: StoredLimit | undefined, now: number): Limit | undefined {
   if (!kept) return undefined
   let reset = Date.parse(kept.resetsAt)
-  if (reset > now) return { percentUsed: kept.percentUsed, resetsAt: kept.resetsAt, isLive: false } as Limit
+  if (reset > now) return { percentUsed: kept.percentUsed, resetsAt: kept.resetsAt, observedAt: kept.observedAt }
   if (kind !== 'seven_day') return undefined
   while (reset <= now) reset += 7 * DAY_MS
-  return { resetsAt: new Date(reset).toISOString(), isLive: false } as Limit
+  return { resetsAt: new Date(reset).toISOString() }
+}
+
+/* The limit this session holds, received at liveAt, or the one stored by any session,
+   whichever was received later. A live limit of unknown age loses to a stored one. */
+function limitOf(kind: Kind, live: readonly SessionRateLimit[], liveAt: number | undefined, kept: StoredLimit | undefined, now: number) {
+  const found = live.find(l => l.kind === kind && l.resetsAt)
+  const stored = storedLimitOf(kind, kept, now)
+  if (!found) return stored
+  const mine: Limit = { percentUsed: found.percentUsed, resetsAt: found.resetsAt!, observedAt: liveAt }
+  if (!stored) return mine
+  if (liveAt === undefined) return stored
+  return stored.observedAt !== undefined && stored.observedAt > liveAt ? stored : mine
 }
 
 const latestEntry = (plans: Ledger, subscription: string): PlanEntry | undefined => {
@@ -295,12 +322,19 @@ function basisOf(e: Estimate | undefined, sinceResetLabel: string | undefined) {
   if (!e) return `No estimate yet: the limit has not reported a usable reading for this window${reset}.`
   const readings = `${e.readings} percent level${e.readings === 1 ? '' : 's'} read this window`
   const mix = e.isMixErrorAssumed ? 'price-mix error assumed at 10%' : `price-mix error from ${e.pastWindows} past windows`
-  return `${readings} · ${mix} · history weight ${e.pastWeight}${reset}`
+  const n = e.droppedReadings
+  const dropped = n > 0 ? ` · ${n} conflicting level${n === 1 ? '' : 's'} set aside` : ''
+  return `${readings} · ${mix} · history weight ${e.pastWeight}${reset}${dropped}`
 }
 
-async function measure(host: Host, given?: readonly SessionRateLimit[]): Promise<Summary | undefined> {
+/* isFresh: `given` holds percents this session has just received, so they and the dollars
+   scanned now describe the same moment. Only such a measure records readings or shares
+   its limits. */
+async function measure(host: Host, given: readonly SessionRateLimit[] | undefined, isFresh: boolean): Promise<Summary | undefined> {
   const now = await host.now()
+  const readAt = now
   const live = given ?? (await host.rateLimits())
+  if (isFresh) lastFreshAt = readAt
   let subscription = await resolveSubscription(host)
 
   let active: { w: (typeof WINDOWS)[number]; limit: Limit }[] = []
@@ -309,11 +343,11 @@ async function measure(host: Host, given?: readonly SessionRateLimit[]): Promise
     const storedLimits = ((await host.get(LIMITS_KEY)) ?? {}) as StoredLimits
     active = []
     for (const w of WINDOWS) {
-      const limit = limitOf(w.kind, live, storedLimits[subscription]?.[w.kind], now)
+      const limit = limitOf(w.kind, live, lastFreshAt, storedLimits[subscription]?.[w.kind], now)
       if (limit) active.push({ w, limit })
     }
     if (active.length === 0) {
-      host.status('Usage: $ after the first reply')
+      host.status('waiting for the first reply')
       return undefined
     }
 
@@ -328,7 +362,7 @@ async function measure(host: Host, given?: readonly SessionRateLimit[]): Promise
     extra.push(...labelArgs(regimes, plans, subscription, now))
     const result = await runHelper<WindowsOutput>(host, extra, 120_000)
     if (!result.out?.windows) {
-      host.status('Usage: $ unavailable')
+      host.status('unavailable')
       host.log(`usage-dollars: ${result.error ?? 'no windows in the helper output'}`)
       return undefined
     }
@@ -344,25 +378,35 @@ async function measure(host: Host, given?: readonly SessionRateLimit[]): Promise
   const labels = out.labels ?? {}
   const profile = out.profile ?? null
 
-  const liveLimits = live.filter(l => l.resetsAt && WINDOWS.some(w => w.kind === l.kind))
+  /* A stored limit gives way to one received later, or to the next window's. */
+  const liveLimits = isFresh ? live.filter(l => l.resetsAt && WINDOWS.some(w => w.kind === l.kind)) : []
   if (liveLimits.length > 0) {
     const stored = ((await host.get(LIMITS_KEY)) ?? {}) as StoredLimits
     const mine = { ...stored[subscription] }
-    for (const l of liveLimits) mine[l.kind] = { percentUsed: l.percentUsed, resetsAt: l.resetsAt! }
-    await host.set(LIMITS_KEY, { ...stored, [subscription]: mine })
+    let isChanged = false
+    for (const l of liveLimits) {
+      const was = mine[l.kind] as StoredLimit | undefined
+      if (was && Date.parse(was.resetsAt) >= Date.parse(l.resetsAt!) && was.observedAt >= readAt) continue
+      mine[l.kind] = { percentUsed: l.percentUsed, resetsAt: l.resetsAt!, observedAt: readAt }
+      isChanged = true
+    }
+    if (isChanged) await host.set(LIMITS_KEY, { ...stored, [subscription]: mine })
   }
 
   /* A guessed subscription must not write readings; with none at all every request is
-     counted, as on a machine without bridge-session records. */
+     counted, as on a machine without bridge-session records. A reading takes its percent
+     from `given` alone, and only for the window the dollars were scanned for. */
   const mayRecord = out.org === null || out.org === undefined || out.orgSource === 'session' || out.orgSource === 'profile'
   const readings = ((await host.get(READINGS_KEY)) ?? {}) as StoredReadings
-  if (mayRecord)
+  if (mayRecord && isFresh && given !== undefined)
     for (const { w, limit } of active) {
       const tally = out.windows[w.name]
-      if (!tally || !limit.isLive || limit.percentUsed === undefined) continue
+      const fresh = given.find(l => l.kind === w.kind && l.resetsAt)
+      if (!tally || !fresh) continue
       const key = windowKey(subscription, w.kind, limit.resetsAt)
+      if (windowKey(subscription, w.kind, fresh.resetsAt!) !== key) continue
       const was = readings[key] ?? { kind: w.kind, resetsAt: limit.resetsAt, byPct: {}, org: subscription }
-      readings[key] = { ...record(was, limit.percentUsed, tally.usd, now), org: subscription }
+      readings[key] = { ...record(was, fresh.percentUsed, tally.usd, readAt), org: subscription }
     }
   const kept = Object.fromEntries(
     Object.entries(readings).filter(([, r]) => Date.parse(r.resetsAt) > now - READINGS_KEPT_MS),
@@ -421,7 +465,7 @@ async function measure(host: Host, given?: readonly SessionRateLimit[]): Promise
           past,
           kind: w.kind,
           now,
-          livePercent: limit.isLive ? limit.percentUsed : undefined,
+          livePercent: limit.observedAt !== undefined && now - limit.observedAt <= FRESH_MS ? limit.percentUsed : undefined,
         })
       : undefined
     if (e?.isPriorContradicted) drafts.push({ id: `inferred:${key}`, kind: 'inferred', text: INFERRED_TEXT })
@@ -432,6 +476,8 @@ async function measure(host: Host, given?: readonly SessionRateLimit[]): Promise
       tally,
       estimate: e,
       sinceResetLabel: regime?.reason === 'manual' ? labels[String(regime.startedAt)] : undefined,
+      percent: limit.percentUsed,
+      percentAt: limit.percentUsed !== undefined ? limit.observedAt : undefined,
     })
   }
   await queueNotices(host, subscription, drafts, now)
@@ -465,7 +511,7 @@ async function measure(host: Host, given?: readonly SessionRateLimit[]): Promise
   }
 }
 
-/** The status line, leading with each window's allowance. */
+/** The status line: what is left of each window's allowance. */
 export function statusOf(summary: Pick<Summary, 'windows'>, isPlanUnseen: boolean) {
   return statusLine(
     summary.windows.map(s => ({ short: s.short, usedUsd: s.tally.usd, allowance: s.estimate?.allowance, left: s.estimate?.left })),
@@ -473,18 +519,27 @@ export function statusOf(summary: Pick<Summary, 'windows'>, isPlanUnseen: boolea
   )
 }
 
-/* One scan at a time, at most once a minute unless forced. */
-export function refresh(host: Host, limits?: readonly SessionRateLimit[], isForced = false) {
-  if (running) return running
-  if (!isForced && Date.now() - lastRunAt < MIN_GAP_MS) return Promise.resolve(last)
+/* One scan at a time, at most once a minute unless forced or fresh. A fresh call that
+   meets a running scan is queued and runs, forced, once that scan settles. */
+export function refresh(host: Host, limits?: readonly SessionRateLimit[], isForced = false, isFresh = false) {
+  if (running) {
+    if (isFresh) pendingFresh = { host, limits }
+    return running
+  }
+  if (!isForced && !isFresh && Date.now() - lastRunAt < MIN_GAP_MS) return Promise.resolve(last)
   lastRunAt = Date.now()
-  running = measure(host, limits)
+  running = measure(host, limits, isFresh)
     .then(summary => (last = summary ?? last))
     .catch(error => {
       host.log(`usage-dollars: ${String(error)}`)
       return last
     })
-    .finally(() => (running = undefined))
+    .finally(() => {
+      running = undefined
+      const queued = pendingFresh
+      pendingFresh = undefined
+      if (queued) void refresh(queued.host, queued.limits, true, true)
+    })
   return running
 }
 
@@ -551,7 +606,7 @@ export async function takeToasts(host: Host) {
   return due.map(n => n.text)
 }
 
-export function toReport(summary: Summary): UsageReport {
+export function toReport(summary: Summary, now: number): UsageReport {
   const windows: WindowReport[] = summary.windows.map(s => ({
     title: s.title,
     short: s.short,
@@ -567,6 +622,8 @@ export function toReport(summary: Summary): UsageReport {
     nextTick: s.estimate?.nextTick,
     pastWeight: s.estimate?.pastWeight,
     isPriorContradicted: s.estimate?.isPriorContradicted,
+    percent: s.percent,
+    percentAgeMinutes: s.percentAt !== undefined ? Math.max(0, Math.round((now - s.percentAt) / MINUTE_MS)) : undefined,
     basis: basisOf(s.estimate, s.sinceResetLabel),
   }))
   const widest = summary.windows[summary.windows.length - 1]

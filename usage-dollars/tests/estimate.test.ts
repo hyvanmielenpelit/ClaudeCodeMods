@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { bounds, estimate, inferRounding, prior, record, regimeView, weightOf } from '../hooks/estimate'
+import { bounds, consistentBounds, estimate, inferRounding, observed, prior, record, regimeView, weightOf } from '../hooks/estimate'
 import type { PastPoint, WindowReadings } from '../hooks/estimate'
 
 const HOUR_MS = 60 * 60 * 1000
@@ -119,4 +119,74 @@ test('regimeView bounds contain the new allowance after a mid-window change', ()
   const b = bounds(regimeView(w, changedAt), 1, 'round')
   expect(b.low).toBeLessThanOrEqual(3000)
   expect(b.high).toBeGreaterThanOrEqual(3000)
+})
+
+/* A $650 five-hour allowance read at 9% and 10%, rounded; `stale` adds a 4% reading with
+   the dollars of the 9% one, as a session holding an old percent would record. */
+function fiveHourAt650(stale: boolean) {
+  let w = empty('five_hour')
+  w = record(w, 9, 60, NOW - 50 * 60 * 1000)
+  w = record(w, 9, 61.5, NOW - 40 * 60 * 1000)
+  if (stale) w = record(w, 4, 61.5, NOW - 40 * 60 * 1000)
+  w = record(w, 10, 62.5, NOW - 30 * 60 * 1000)
+  return record(w, 10, 64, NOW - 20 * 60 * 1000)
+}
+
+test('a stale percent is set aside, and the estimate holds $650 and not $960', () => {
+  const w = fiveHourAt650(true)
+  const c = consistentBounds(w, 1, 'union')
+  expect(c.dropped).toBe(1)
+  expect(c.kept).toBe(2)
+  const e = estimate(w, 64, { resolution: 1, rounding: 'union', past: [], kind: 'five_hour', now: NOW })
+  expect(e!.droppedReadings).toBe(1)
+  expect(e!.allowance.low).toBeLessThanOrEqual(650)
+  expect(e!.allowance.high).toBeGreaterThanOrEqual(650)
+  expect(e!.allowance.high).toBeLessThan(960)
+})
+
+test('without a conflict, consistentBounds equals bounds', () => {
+  for (const w of [simulate(3000, 600, 1.5, rounded), fiveHourAt650(false)]) {
+    const c = consistentBounds(w, 1, 'union')
+    const b = bounds(w, 1, 'union')
+    expect(c.low).toBe(b.low)
+    expect(c.high).toBe(b.high)
+    expect(c.dropped).toBe(0)
+  }
+})
+
+test('of two agreeing pairs that contradict each other, the newer pair is kept', () => {
+  let w = empty('five_hour')
+  w = record(w, 4, 50, NOW - 3 * HOUR_MS)
+  w = record(w, 5, 62, NOW - 3 * HOUR_MS + 60 * 1000)
+  w = record(w, 9, 61.5, NOW - HOUR_MS)
+  w = record(w, 10, 64, NOW - HOUR_MS + 60 * 1000)
+  const c = consistentBounds(w, 1, 'union')
+  const newer = bounds(fiveHourAt650(false), 1, 'union')
+  expect(c.kept).toBe(2)
+  expect(c.dropped).toBe(2)
+  expect(c.low).toBe(newer.low)
+  expect(c.low).toBeLessThan(650)
+  expect(c.high).toBeGreaterThan(650)
+})
+
+test('a closed window with a conflicting level is no observed allowance', () => {
+  expect(observed(fiveHourAt650(false), 1, 'union')).toBeDefined()
+  expect(observed(fiveHourAt650(true), 1, 'union')).toBeUndefined()
+})
+
+test('when every level contradicts itself, the estimate meets in the middle', () => {
+  let w = empty('five_hour')
+  w = record(w, 1, 10, NOW - 2 * HOUR_MS)
+  w = record(w, 1, 100, NOW - 90 * 60 * 1000)
+  w = record(w, 2, 20, NOW - HOUR_MS)
+  w = record(w, 2, 200, NOW - 30 * 60 * 1000)
+  const c = consistentBounds(w, 1, 'union')
+  expect(c.kept).toBe(0)
+  expect(c.dropped).toBe(2)
+  const b = bounds(w, 1, 'union')
+  expect(b.low).toBeGreaterThan(b.high)
+  const e = estimate(w, 200, { resolution: 1, rounding: 'union', past: [], kind: 'five_hour', now: NOW })
+  expect(e).toBeDefined()
+  expect(Math.abs(e!.allowance.value / Math.sqrt(b.low * b.high) - 1)).toBeLessThan(1e-9)
+  expect(e!.droppedReadings).toBe(0)
 })

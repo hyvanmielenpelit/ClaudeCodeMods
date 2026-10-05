@@ -5,7 +5,7 @@ function-hook plugins. The repository is also a plugin marketplace.
 
 | Mod | What it does |
 |---|---|
-| [usage-dollars](usage-dollars) | Subscription usage for the 5-hour window and the week as API-equivalent dollars: the estimated allowance first, then left and used, with 90% ranges; spending reports by date range. |
+| [usage-dollars](usage-dollars) | Subscription usage for the 5-hour window and the week as API-equivalent dollars: the estimated allowance first, then used and left, with 90% ranges; spending reports by date range. |
 
 ## Installing
 
@@ -30,20 +30,21 @@ releases. Check a mod with `claude plugin validate <folder>`.
 
 ## usage-dollars
 
-Shows on the status line, leading with the estimated allowance:
+Shows on the status line, what is left of each window's estimated allowance:
 
 ```
-5h ~$756 allowance · ~$716 left  │  Week ~$3.9k allowance · ~$3.9k left
+usage-dollars  5h ~$850 left of $913 · Week ~$2.7k left of $2.8k
 ```
 
-While a window has no estimate yet it reads `5h estimating · $40 used`. A leading `⚠`
-means a plan change was observed and the card has not been opened since.
+While a window has no estimate yet it reads `5h $40 used, estimating`, and once nothing is
+left, `5h at limit`. `⚠ Plan changed` means a plan change was observed and the card has not
+been opened since.
 
 ### Commands
 
 | Command | Shows |
 |---|---|
-| `/usage-dollars` | The window card: plan, notices, each window's allowance first, then left, used, the next tick, and spending per model |
+| `/usage-dollars` | The window card: plan, notices, each window's allowance first, then used, left, the next tick, and spending per model |
 | `/usage-dollars report` | Spending in the last 24 hours, per day and per model |
 | `/usage-dollars 24h`, `/usage-dollars 7d` | Spending in the last N hours or days, up to 90 days |
 | `/usage-dollars today` | Spending since local midnight |
@@ -54,10 +55,11 @@ means a plan change was observed and the card has not been opened since.
 
 The window card is allowance-first: a headline row gives each window's estimated allowance,
 its 90% range and a confidence label (`good` within about ±10%, `fair` within ±30%,
-`rough` beyond). Each window then shows what is left and what is used, a bar of used
-dollars against the allowance range, and "next tick": about how many more dollars until the
-reported percent moves again. Before the first estimate a window reads "estimating…"; no
-dollar figure can be given until the limit reports a higher percent.
+`rough` beyond). Each window then shows what is used and what is left, a bar of used
+dollars against the allowance range, the percent the estimate rests on ("Limit reports 10%
+· read 2 min ago"), and "next tick": about how many more dollars until the reported percent
+moves again. Before the first estimate a window reads "estimating…"; no dollar figure can be
+given until the limit reports a higher percent.
 
 A spending report covers only as far back as this machine's transcripts do. When the range
 starts earlier, the report says where the transcripts begin.
@@ -120,7 +122,11 @@ promotion change can no longer be undone.
   `used / (p + 1)%` and `used / (p - 0.5)%` while it is not known whether the API rounds
   or truncates. Once closed windows show which it does, the tighter bounds of that rule
   apply. The mod keeps the readings of every window and intersects them, so the bounds
-  narrow each time the percent ticks over.
+  narrow each time the percent ticks over. A reading is taken only when this session has
+  just received the percent, after its own turn or when the percent moves, and is paired
+  with the dollars of that moment; running sessions share the freshest percent between
+  them. Readings that contradict the rest are set aside, the newest kept, and counted in
+  the card's basis line.
 - **The 90% range** widens those bounds by how far API prices may differ from the limit's
   own weighting of tokens: the spread of past windows' allowances, never taken below 3%,
   once there are effectively at least three, otherwise an assumed 10%. Past windows also
@@ -141,7 +147,8 @@ How fast the allowance can be known after a change of limits:
 On a 5-hour window that takes under an hour of work; on the week, about a day.
 
 Upgrading from 0.3.0 restarts the estimates once: the readings it kept cannot be attributed
-to a subscription.
+to a subscription. Upgrading from 0.4.0 drops the stored readings once: some paired a
+session's old percent with current dollars.
 
 ### Limits
 

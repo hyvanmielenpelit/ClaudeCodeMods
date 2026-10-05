@@ -10,8 +10,13 @@ type Ui = Elements[RenderSurface]
 export const money = (usd: number) =>
   usd >= 100 ? `$${Math.round(usd).toLocaleString('en-US')}` : `$${usd.toFixed(2)}`
 
-export const short = (usd: number) =>
-  usd >= 1000 ? `$${(usd / 1000).toFixed(1)}k` : usd >= 100 ? `$${Math.round(usd)}` : `$${usd.toFixed(2)}`
+/** $4.20, $913, $2.8k, $28k: the status line's figures. */
+export function compact(usd: number) {
+  if (usd < 10) return `$${usd.toFixed(2)}`
+  if (Math.round(usd) < 1000) return `$${Math.round(usd)}`
+  const k = usd / 1000
+  return Math.round(k * 10) < 100 ? `$${k.toFixed(1)}k` : `$${Math.round(k)}k`
+}
 
 const span = (r: RangeReport) => `${money(r.low)} – ${money(r.high)}`
 
@@ -40,15 +45,19 @@ const NO_ESTIMATE = 'first estimate when the limit next reports a higher percent
 
 export type StatusWindow = { short: string; usedUsd: number; allowance?: RangeReport; left?: RangeReport }
 
+/* "5h ~$850 left of $913 · Week ~$2.7k left of $2.8k": one tilde per window, since both
+   figures come from one estimate. */
 export function statusLine(windows: readonly StatusWindow[], isPlanUnseen: boolean) {
   const text = windows
     .map(w =>
-      w.allowance && w.left
-        ? `${w.short} ~${short(w.allowance.value)} allowance · ~${short(Math.max(0, w.left.value))} left`
-        : `${w.short} estimating · ${short(w.usedUsd)} used`,
+      !w.allowance || !w.left
+        ? `${w.short} ${compact(w.usedUsd)} used, estimating`
+        : w.left.value <= 0
+          ? `${w.short} at limit`
+          : `${w.short} ~${compact(w.left.value)} left of ${compact(w.allowance.value)}`,
     )
-    .join('  │  ')
-  return `${isPlanUnseen ? '⚠ ' : ''}${text}`
+    .join(' · ')
+  return `${isPlanUnseen ? '⚠ Plan changed · ' : ''}${text}`
 }
 
 export function planLine(p: PlanReport) {
@@ -63,6 +72,14 @@ export function planLine(p: PlanReport) {
 }
 
 const headlineLabel = (w: WindowReport) => (w.short === '5h' ? '5-HOUR ALLOWANCE' : 'WEEKLY ALLOWANCE')
+
+const ageOf = (minutes: number) =>
+  minutes < 1 ? 'just now' : minutes < 60 ? `${minutes} min ago` : `${Math.floor(minutes / 60)} h ago`
+
+const percentLine = (w: WindowReport) =>
+  w.percent === undefined
+    ? undefined
+    : `Limit reports ${w.percent}%${w.percentAgeMinutes !== undefined ? ` · read ${ageOf(w.percentAgeMinutes)}` : ''}`
 
 const nextTickLine = (w: WindowReport) =>
   w.nextTick ? `Next tick in about ${money(w.nextTick.value)} (between ${money(w.nextTick.low)} and ${money(w.nextTick.high)})` : undefined
@@ -82,15 +99,17 @@ export function markdownWindows(r: UsageReport, id: string) {
     '',
   )
   for (const w of r.windows) {
+    const reported = percentLine(w)
     const tick = nextTickLine(w)
     lines.push(
       `**${w.title}** · resets ${w.resetLong}${w.resetIn ? ` (in ${w.resetIn})` : ''}`,
       '',
       '| | Estimate | 90% range |',
       '|:--|--:|--:|',
-      `| Left | ${w.left ? `~${money(w.left.value)}` : '—'} | ${w.left ? span(w.left) : ''} |`,
       `| Used | ${money(w.usedUsd)} | ${count(w.requests)} requests |`,
+      `| Left | ${w.left ? `~${money(w.left.value)}` : '—'} | ${w.left ? span(w.left) : ''} |`,
       '',
+      ...(reported ? [reported, ''] : []),
       ...(tick ? [tick, ''] : []),
       `_${w.basis}_`,
       '',
@@ -235,10 +254,11 @@ export function windowCard(ui: Ui, r: UsageReport, columns: number) {
 
   const section = (w: WindowReport) => {
     const tiles = [
-      { label: 'LEFT', value: w.left ? `~${money(w.left.value)}` : '—', note: w.left ? span(w.left) : 'no estimate yet' },
       { label: 'USED', value: money(w.usedUsd), note: `${count(w.requests)} requests` },
+      { label: 'LEFT', value: w.left ? `~${money(w.left.value)}` : '—', note: w.left ? span(w.left) : 'no estimate yet' },
     ]
     const bar = meterCells(w, cells)
+    const reported = percentLine(w)
     const tick = nextTickLine(w)
     return (
       <Box flexDirection="column" rowGap={1}>
@@ -269,6 +289,7 @@ export function windowCard(ui: Ui, r: UsageReport, columns: number) {
             </Text>
           </Text>
         )}
+        {reported ? <Text>{reported}</Text> : undefined}
         {tick ? <Text>{tick}</Text> : undefined}
         <Text dimColor>{w.basis}</Text>
       </Box>
