@@ -378,7 +378,9 @@ function basisOf(e: Estimate | undefined, isUnpriced: boolean, sinceResetLabel: 
   const reset = sinceResetLabel ? ` · since reset ${sinceResetLabel}` : ''
   if (isUnpriced) return `Unpriced models in use: no estimate${reset}.`
   if (!e) return `No estimate yet: the limit has not reported a usable reading for this window${reset}.`
-  const readings = `${e.readings} percent level${e.readings === 1 ? '' : 's'} read`
+  const readings = e.isPriorOnly
+    ? 'From past windows only: no tick read in this window yet'
+    : `${e.readings} percent level${e.readings === 1 ? '' : 's'} read`
   const within = `within-window spread ${e.isWithinSpreadAssumed ? 'assumed' : 'measured'}`
   const between = e.isSpreadAssumed
     ? 'between-window spread assumed'

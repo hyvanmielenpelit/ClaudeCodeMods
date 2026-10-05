@@ -105,6 +105,65 @@ test('a closed window short of 10% is no past point', () => {
   expect(pastPoints([simulate(1000, 150, 2, rounded, empty('five_hour', reset))], [], 'five_hour', 1, 'round', 0.5).length).toBe(1)
 })
 
+test('a closed window reported at 10% is a past point under every rounding rule', () => {
+  const reset = new Date(NOW - HOUR_MS).toISOString()
+  /* The last reading, $96 at share 9.6, is the first at level 10. */
+  const atTen = simulate(1000, 96, 2, rounded, empty('five_hour', reset))
+  const atNine = simulate(1000, 94, 2, rounded, empty('five_hour', reset))
+  for (const r of ['union', 'round', 'truncate'] as const) {
+    expect(pastPoints([atTen], [], 'five_hour', 1, r, 0.5).length).toBe(1)
+    expect(pastPoints([atNine], [], 'five_hour', 1, r, 0.5).length).toBe(0)
+  }
+})
+
+test('a 0% reading is no evidence', () => {
+  const w = record(empty('five_hour'), 0, 0.14, NOW)
+  expect(evidenceOf(w, 1, 'union')).toBeUndefined()
+  expect(estimate(w, 0.14, { resolution: 1, rounding: 'union', past: [], kind: 'five_hour', now: NOW })).toBeUndefined()
+})
+
+const zeroThenOne = () => record(record(empty('five_hour'), 0, 6, NOW - 2 * 60 * 1000), 1, 8, NOW - 60 * 1000)
+
+test('a 0% reading still bounds the allowance', () => {
+  /* Level 0's dollars over its upper share of 1%. */
+  expect(bounds(zeroThenOne(), 1, 'union')).toEqual({ low: 600, high: 1600 })
+})
+
+test('the 0 → 1 crossing is still evidence', () => {
+  const e = evidenceOf(zeroThenOne(), 1, 'union')!
+  expect(e.pct).toBe(1)
+  expect(e.crossingUsd).toBe(7)
+})
+
+const recentPast = () => [1, 2, 3].map(i => pastAt(1000, i * 5 * HOUR_MS))
+
+test('with a usable prior, a window at 0% is estimated from the prior alone', () => {
+  const w = record(empty('five_hour'), 0, 0.14, NOW)
+  const options = { resolution: 1, rounding: 'union' as const, kind: 'five_hour', now: NOW, livePercent: 0 }
+  const e = estimate(w, 0.14, { ...options, past: recentPast() })!
+  expect(e.isPriorOnly).toBe(true)
+  expect(e.isPriorContradicted).toBe(false)
+  expect(Math.abs(e.allowance.value / 1000 - 1)).toBeLessThan(0.01)
+  expect(e.allowance.low).toBeLessThanOrEqual(1000)
+  expect(e.allowance.high).toBeGreaterThanOrEqual(1000)
+  expect(e.left.value).toBe(e.allowance.value - 0.14)
+  expect(e.nextTick!.low).toBe(0)
+  const single = estimate(w, 0.14, { ...options, past: [pastAt(703, 5 * HOUR_MS)] })!
+  expect(single.isPriorOnly).toBe(true)
+})
+
+test('after the first tick the estimate rests on the readings again', () => {
+  const e = estimate(zeroThenOne(), 8, { resolution: 1, rounding: 'union', past: recentPast(), kind: 'five_hour', now: NOW, livePercent: 1 })!
+  expect(e.isPriorOnly).toBe(false)
+})
+
+test('a window read only at 100% has no estimate, with or without a prior', () => {
+  const w = record(empty('five_hour'), 100, 1200, NOW)
+  const options = { resolution: 1, rounding: 'union' as const, past: recentPast(), kind: 'five_hour', now: NOW }
+  expect(estimate(w, 1200, { ...options, livePercent: 100 })).toBeUndefined()
+  expect(estimate(w, 1200, options)).toBeUndefined()
+})
+
 test('a past point from a window that closed early carries the within-window term', () => {
   const closed = simulate(1000, 200, 2, rounded, empty('five_hour', new Date(NOW - HOUR_MS).toISOString()))
   const bare = pastOf(closed, 1, 'round', 0)!

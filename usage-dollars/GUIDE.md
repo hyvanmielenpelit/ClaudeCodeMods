@@ -99,7 +99,7 @@ Below the headline, each window shows:
 | **Left** | Allowance minus used, with its range |
 | **Limit reports 10% · read 2 min ago** | The percent the estimate rests on, and how fresh it is |
 | **Next tick** | About how many dollars until the percent moves again; shown while the percent is under 5 minutes old |
-| **Basis line** | Percent levels read, which spreads are assumed or measured, and the history weight |
+| **Basis line** | Percent levels read, or "From past windows only" while the window is still at 0%; which spreads are assumed or measured; and the history weight |
 
 > **Note:** A wide range early in a window is expected, not a fault. It narrows as the
 > window fills, and sooner once closed windows have measured the spreads.
@@ -221,7 +221,7 @@ needs a fix, **ℹ** information.
 | Symptom | Likely cause | Do |
 |---------|--------------|----|
 | "Waiting for the first usage reading" | No reply in this session yet, and none stored | Send any message, or press the card's button |
-| Status line stays "estimating" | No reading yet, or unpriced models | `/usage-dollars`, read the basis line, then `check` |
+| Status line stays "estimating" | No reading yet, the window is still at 0% with no closed windows behind it, or unpriced models | `/usage-dollars`, read the basis line, then `check` |
 | Status line says "unavailable" | The helper failed | `check`: the Helper item |
 | Calibration counts never grow | Lost readings, or windows closing below 10% | `check`, then restart sessions |
 | Range suddenly much wider | A reset, plan, promotion or price table change | Nothing: it narrows again |

@@ -64,7 +64,8 @@ measured. Each window then shows what is used and what is left, a bar of used do
 against the allowance range, the percent the estimate rests on ("Limit reports 10% · read
 2 min ago"), and "next tick": about how many more dollars until the reported percent moves
 again. Before the first estimate a window reads "estimating…"; the first estimate follows
-the first reply.
+the first reply that finds the window above 0%, or comes at once from past windows when
+there are any.
 
 Until an installation has stored a reading, `/usage-dollars` and `/usage-dollars calibrate`
 show a "Waiting for the first usage reading" card instead. A reading comes only with a
@@ -168,7 +169,10 @@ promotion change can no longer be undone.
   divided by the share at the tick give the dollars per percent; otherwise the share
   anywhere in the level's interval does. Until closed windows show whether the API rounds
   or truncates, the tick is either rule's, and the range covers both. A level of 100% is
-  used only through its crossing: spending can continue past the limit.
+  used only through its crossing: spending can continue past the limit. A level of 0% is
+  not used either, since it only says the share is under one tick; while it is the only
+  level read, the estimate is the prior from past windows alone, when there is one, and
+  the basis line says so.
 - **The 90% range** comes from a stated model. The dollars one percent costs vary within
   a window, because API prices weight tokens differently from the limit. Read at share
   `s`, the dollars per percent so far differ from the whole window's by a relative spread

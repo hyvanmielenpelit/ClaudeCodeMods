@@ -56,6 +56,8 @@ export type Estimate = {
   /** No closed window has measured the within-window spread yet. */
   isWithinSpreadAssumed: boolean
   isPriorContradicted: boolean
+  /** No level above 0 read in this window: the estimate is the prior alone. */
+  isPriorOnly: boolean
   confidence: Confidence
   nextTick?: RangeEstimate
 }
@@ -187,7 +189,8 @@ function evidenceAt(pct: number, usd: number, usdWidth: number, share: { s: numb
 
 /** log A and its variance from the newest level of a window, the level with the latest
     reading. A level at or above 100 is used only through its crossing, since spending
-    can continue past the limit; without one the next newest level is used. */
+    can continue past the limit; without one the next newest level is used. Level 0 is
+    never used, since it bounds the share only from above. */
 export function evidenceOf(w: WindowReadings, resolution: number, rounding: Rounding, omega = 0): Evidence | undefined {
   const levels = levelsOf(w)
   const newest = [...levels].sort((a, b) => b.bucket.maxAt - a.bucket.maxAt)
@@ -197,7 +200,7 @@ export function evidenceOf(w: WindowReadings, resolution: number, rounding: Roun
       const e = evidenceAt(level.pct, crossing.usd, crossing.width, crossingShareOf(level.pct, resolution, rounding), omega)
       return e && { ...e, crossingUsd: crossing.usd }
     }
-    if (level.pct >= 100) continue
+    if (level.pct >= 100 || level.pct <= 0) continue
     const slack = level.bucket.maxSlack ?? 0
     return evidenceAt(level.pct, level.bucket.maxUsd - slack / 2, slack, levelShareOf(level.pct, resolution, rounding), omega)
   }
@@ -208,7 +211,7 @@ export function evidenceOf(w: WindowReadings, resolution: number, rounding: Roun
     of where it stopped, once it reached 10%. */
 export function pastOf(w: WindowReadings, resolution: number, rounding: Rounding, omega: number): PastPoint | undefined {
   const e = evidenceOf(w, resolution, rounding, omega)
-  if (!e || e.share < MIN_PAST_SHARE) return undefined
+  if (!e || e.pct < MIN_PAST_SHARE) return undefined
   return { logA: e.logA, variance: e.variance + e.shift ** 2, at: Date.parse(w.resetsAt) }
 }
 
@@ -303,7 +306,7 @@ export function calibrateOmega(
   let windows = 0
   for (const w of closed) {
     const end = evidenceOf(w, resolution, rounding)
-    if (!end || end.share < MIN_PAST_SHARE) continue
+    if (!end || end.pct < MIN_PAST_SHARE) continue
     const age = weightOf(kind, now - Date.parse(w.resetsAt))
     const levels = levelsOf(w)
     let isCounted = false
@@ -435,16 +438,18 @@ export function estimate(w: WindowReadings, usedUsd: number, options: EstimateOp
   const { resolution, rounding, past, kind, now, livePercent } = options
   const spread = options.spread ?? ASSUMED_SPREAD
   const ev = evidenceOf(w, resolution, rounding, spread.omega)
-  if (!ev) return undefined
   const p = prior(past, kind, now)
   const isAtLimit = livePercent !== undefined && livePercent >= 100
+  /* Only level 0 read: the prior alone stands in for the evidence. */
+  const isUnticked = Object.keys(w.byPct).every(key => Number(key) <= 0)
+  if (!ev && !(isUnticked && p.isUsable && !isAtLimit)) return undefined
 
-  let m = ev.logA
-  let v = ev.variance
-  let shift = ev.shift
-  let df = NU0 + spread.weight
+  let m = ev ? ev.logA : p.mean
+  let v = ev ? ev.variance : p.variance
+  let shift = ev ? ev.shift : 0
+  let df = ev ? NU0 + spread.weight : p.df
   let isPriorContradicted = false
-  if (p.isUsable && !isAtLimit) {
+  if (ev && p.isUsable && !isAtLimit) {
     const z = Math.max(0, Math.abs(ev.logA - p.mean) - ev.shift) / Math.sqrt(ev.variance + p.variance)
     isPriorContradicted = z > tQuantile(0.995, p.df)
     if (!isPriorContradicted) {
@@ -466,7 +471,7 @@ export function estimate(w: WindowReadings, usedUsd: number, options: EstimateOp
     ? { value: 0, low: 0, high: 0 }
     : { value: allowance.value - usedUsd, low: allowance.low - usedUsd, high: allowance.high - usedUsd }
   const isLive = livePercent !== undefined && !isAtLimit
-  const isSameLevel = livePercent !== undefined && Math.abs(ev.pct - livePercent) < resolution / 1000
+  const isSameLevel = ev !== undefined && livePercent !== undefined && Math.abs(ev.pct - livePercent) < resolution / 1000
   return {
     allowance,
     left,
@@ -476,7 +481,8 @@ export function estimate(w: WindowReadings, usedUsd: number, options: EstimateOp
     isSpreadAssumed: p.isSpreadAssumed,
     isWithinSpreadAssumed: spread.isAssumed,
     isPriorContradicted,
+    isPriorOnly: !ev,
     confidence: confidenceOf(allowance),
-    nextTick: isLive ? nextTickOf(allowance, usedUsd, resolution, isSameLevel ? ev.crossingUsd : undefined) : undefined,
+    nextTick: isLive ? nextTickOf(allowance, usedUsd, resolution, isSameLevel ? ev?.crossingUsd : undefined) : undefined,
   }
 }
