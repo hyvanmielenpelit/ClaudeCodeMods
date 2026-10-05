@@ -57,9 +57,26 @@ test('compact figures', () => {
 })
 
 test('the first-reading card says all is well, what to do, and names the command to run again', () => {
-  const text = markdownWaiting({ type: 'waiting', command: '/usage-dollars calibrate' }, '5')
+  const text = markdownWaiting({ type: 'waiting', command: '/usage-dollars calibrate', canSend: true }, '5')
   expect(text.startsWith('### Waiting for the first usage reading\n\n✓ Everything is in order.')).toBe(true)
   expect(text).toContain('2. When the reply has finished, run /usage-dollars calibrate again.')
   expect(text).toContain('3. The card then shows what each window’s estimate rests on.')
+  expect(text).not.toContain('A check message was sent.')
   expect(text.endsWith('[//]: # (usage-dollars:report:5)')).toBe(true)
+})
+
+test('after the check message is sent, the first-reading card says to run the command once its reply has finished', () => {
+  const text = markdownWaiting({ type: 'waiting', command: '/usage-dollars', canSend: false }, '6')
+  expect(text.startsWith('### Waiting for the first usage reading\n\n✓ Everything is in order.')).toBe(true)
+  expect(text).toContain('A check message was sent. When its reply has finished, run /usage-dollars again.')
+  expect(text).toContain('**What to do**')
+})
+
+test('without a subscription the first-reading card replaces the steps, and the check stays green', () => {
+  const text = markdownWaiting({ type: 'waiting', command: '/usage-dollars', canSend: false, isUnsubscribed: true }, '7')
+  expect(text.startsWith('### Waiting for the first usage reading\n\n✓ Everything is in order.')).toBe(true)
+  expect(text).toContain('This sign-in has no subscription usage limits, so there is nothing to show; spending reports still work.')
+  expect(text).not.toContain('**What to do**')
+  expect(text).not.toContain('**How it works from here**')
+  expect(text).not.toContain('A check message was sent.')
 })

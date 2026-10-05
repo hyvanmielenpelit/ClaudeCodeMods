@@ -17,6 +17,7 @@ import type {
   WaitingReport,
   WindowReport,
 } from '../types'
+import { CHECK_LABEL } from './probe'
 
 type Ui = Elements[RenderSurface]
 
@@ -522,6 +523,13 @@ const waitingSteps = (command: string) => [
     : 'The card then shows each window: the estimated allowance, what is used and what is left.',
 ]
 
+const WAITING_UNSUBSCRIBED =
+  'This sign-in has no subscription usage limits, so there is nothing to show; spending reports still work.'
+
+const WAITING_SEND = 'Or let the plugin send one for you:'
+
+const checkSent = (command: string) => `A check message was sent. When its reply has finished, run ${command} again.`
+
 const WAITING_NEXT = [
   'Every reply refreshes the reading, and the status line keeps showing what is left in each window.',
   'Readings are stored for this installation, so later sessions show figures at once, before their first reply.',
@@ -541,22 +549,28 @@ export function markdownWaiting(r: WaitingReport, id: string) {
     '',
     WAITING_WHY,
     '',
-    '**What to do**',
-    '',
-    ...waitingSteps(r.command).map((step, i) => `${i + 1}. ${step}`),
-    '',
-    '**How it works from here**',
-    '',
-    ...WAITING_NEXT.map(line => `- ${line}`),
-    '',
+    ...(r.isUnsubscribed
+      ? [WAITING_UNSUBSCRIBED, '']
+      : [
+          '**What to do**',
+          '',
+          ...waitingSteps(r.command).map((step, i) => `${i + 1}. ${step}`),
+          '',
+          ...(r.canSend === false ? [checkSent(r.command), ''] : []),
+          '**How it works from here**',
+          '',
+          ...WAITING_NEXT.map(line => `- ${line}`),
+          '',
+        ]),
     `_${WAITING_FOOTER}_`,
     '',
     `[//]: # (usage-dollars:report:${id})`,
   ].join('\n')
 }
 
-export function waitingCard(ui: Ui, r: WaitingReport) {
-  const { Box, Text } = ui
+/* onSend sends the check message; without it the card offers no button. */
+export function waitingCard(ui: Ui, r: WaitingReport, onSend?: () => void) {
+  const { Box, Button, Text } = ui
   const heading = (text: string) => <Text bold>{text}</Text>
   return (
     <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={2} paddingY={1} rowGap={1}>
@@ -579,35 +593,49 @@ export function waitingCard(ui: Ui, r: WaitingReport) {
         <Text>{WAITING_WHY}</Text>
       </Box>
 
-      <Box flexDirection="column">
-        {heading('What to do')}
-        {waitingSteps(r.command).map((step, i) => (
-          <Box flexDirection="row" columnGap={1}>
-            <Box width={3}>
-              <Text color="blue" bold>
-                {`${i + 1}.`}
-              </Text>
+      {r.isUnsubscribed ? (
+        <Text>{WAITING_UNSUBSCRIBED}</Text>
+      ) : (
+        <Box flexDirection="column">
+          {heading('What to do')}
+          {waitingSteps(r.command).map((step, i) => (
+            <Box flexDirection="row" columnGap={1}>
+              <Box width={3}>
+                <Text color="blue" bold>
+                  {`${i + 1}.`}
+                </Text>
+              </Box>
+              <Box flexGrow={1} flexShrink={1}>
+                <Text>{step}</Text>
+              </Box>
             </Box>
-            <Box flexGrow={1} flexShrink={1}>
-              <Text>{step}</Text>
-            </Box>
-          </Box>
-        ))}
-      </Box>
+          ))}
+        </Box>
+      )}
 
-      <Box flexDirection="column">
-        {heading('How it works from here')}
-        {WAITING_NEXT.map(line => (
-          <Box flexDirection="row" columnGap={1}>
-            <Box width={2}>
-              <Text dimColor>•</Text>
+      {!r.isUnsubscribed && r.canSend && onSend ? (
+        <Box flexDirection="row" columnGap={1} flexWrap="wrap" alignItems="center">
+          <Text>{WAITING_SEND}</Text>
+          <Button key="send-check" label={CHECK_LABEL} onPress={() => onSend()} />
+        </Box>
+      ) : undefined}
+      {!r.isUnsubscribed && r.canSend === false ? <Text dimColor>{checkSent(r.command)}</Text> : undefined}
+
+      {r.isUnsubscribed ? undefined : (
+        <Box flexDirection="column">
+          {heading('How it works from here')}
+          {WAITING_NEXT.map(line => (
+            <Box flexDirection="row" columnGap={1}>
+              <Box width={2}>
+                <Text dimColor>•</Text>
+              </Box>
+              <Box flexGrow={1} flexShrink={1}>
+                <Text>{line}</Text>
+              </Box>
             </Box>
-            <Box flexGrow={1} flexShrink={1}>
-              <Text>{line}</Text>
-            </Box>
-          </Box>
-        ))}
-      </Box>
+          ))}
+        </Box>
+      )}
 
       <Text dimColor>{WAITING_FOOTER}</Text>
     </Box>

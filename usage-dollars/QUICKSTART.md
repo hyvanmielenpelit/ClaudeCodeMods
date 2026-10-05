@@ -20,6 +20,9 @@ and how much is left, right on the status line:
 
 That is all. Readings are taken automatically after every reply.
 
+Before the first reply on a new installation, `/usage-dollars` shows a waiting card: send
+any message, or press its button to send a short check message (it uses one turn).
+
 ## Everyday commands
 
 | To | Run |

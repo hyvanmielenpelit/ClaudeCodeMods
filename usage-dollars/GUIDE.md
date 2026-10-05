@@ -59,6 +59,26 @@ What does help:
 - **Windows close with some use in them.** A closed window counts once it reached 10%.
   Light use calibrates more slowly, but it does calibrate.
 
+### The first reading
+
+Until an installation has stored a reading, `/usage-dollars` and `/usage-dollars
+calibrate` show the **Waiting for the first usage reading** card. A reading comes only with
+a reply in the main conversation, so:
+
+- **In a terminal session** you rarely see the card: Claude Code sends a minimal request of
+  its own at startup there, and that brings a reading.
+- **In the desktop app** a new session has no reading until its first reply. Send any
+  message, or press the card's button, **Send a short check message (uses one turn)**.
+
+The button sends one message that says what it is, asks for the single word OK and no
+tools, and carries nothing from the session. It costs one turn of the session's model and
+adds that message and its reply to the conversation. It is sent only when you press the
+button, and it is not offered again until a turn completes. A plugin's own model request
+does not bring a reading, which is why nothing is sent automatically.
+
+A sign-in without a subscription (an API key) never gets a reading. The card says so, and
+spending reports still work.
+
 ## 3. Reading the card
 
 `/usage-dollars` leads with each window's **allowance**: the estimate, its 90% range, and a
@@ -200,6 +220,7 @@ needs a fix, **ℹ** information.
 
 | Symptom | Likely cause | Do |
 |---------|--------------|----|
+| "Waiting for the first usage reading" | No reply in this session yet, and none stored | Send any message, or press the card's button |
 | Status line stays "estimating" | No reading yet, or unpriced models | `/usage-dollars`, read the basis line, then `check` |
 | Status line says "unavailable" | The helper failed | `check`: the Helper item |
 | Calibration counts never grow | Lost readings, or windows closing below 10% | `check`, then restart sessions |

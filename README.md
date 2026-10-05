@@ -66,6 +66,16 @@ against the allowance range, the percent the estimate rests on ("Limit reports 1
 again. Before the first estimate a window reads "estimating…"; the first estimate follows
 the first reply.
 
+Until an installation has stored a reading, `/usage-dollars` and `/usage-dollars calibrate`
+show a "Waiting for the first usage reading" card instead. A reading comes only with a
+reply in the main conversation. Interactive terminal sessions rarely need to wait, because
+Claude Code sends a minimal request of its own at startup there. A new desktop session has
+no reading until its first reply. The card's button, "Send a short check message (uses one
+turn)", sends one self-describing message asking for a one-word reply and no tools. It is
+sent only when pressed and is not offered again until a turn completes. A plugin's own
+model request does not bring a reading, so nothing is sent automatically. A sign-in without
+a subscription never gets a reading, and the card says so.
+
 A spending report covers only as far back as this machine's transcripts do. When the range
 starts earlier, the report says where the transcripts begin.
 

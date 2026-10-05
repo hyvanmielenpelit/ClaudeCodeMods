@@ -116,6 +116,10 @@ export type GuideReport = {
 export type WaitingReport = {
   type: 'waiting'
   command: string
+  /** The card offers to send the check message: no check is in flight in this session. */
+  canSend: boolean
+  /** Signed in without a subscription: no reading will ever arrive. */
+  isUnsubscribed?: boolean
 }
 
 declare module 'claude-code' {

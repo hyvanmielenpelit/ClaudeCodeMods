@@ -23,6 +23,7 @@ import {
   refresh,
   refreshHistory,
   resetEstimates,
+  resolveSubscription,
   spendReport,
   statusOf,
   takeToasts,
@@ -31,6 +32,7 @@ import {
   undoReset,
 } from './measure'
 import type { Host } from './measure'
+import { CHECK_PROMPT, waitingReport } from './probe'
 
 const HOUR_MS = 60 * 60 * 1000
 const MAX_REPORT_HOURS = 90 * 24
@@ -48,6 +50,9 @@ const GUIDE_FILES = new Map([
 ])
 
 const reports = atom({ plugin: 'usage-dollars', key: 'reports' } as const, {})
+
+/* From a press of the first-reading card's button until the next turn completes. */
+let isCheckInFlight = false
 
 /* $ never crosses an import, so the measure module reaches the engine through these. */
 function hostOf($: EngineInterface): Host {
@@ -87,8 +92,32 @@ async function keep($: EngineInterface, report: UsageReport | SpendReport | Chec
 
 /* The first-reading card, while this installation holds no reading to show. */
 async function waiting($: EngineInterface, command: string) {
-  const report: WaitingReport = { type: 'waiting', command }
+  const report: WaitingReport = waitingReport(command, await resolveSubscription(hostOf($)), isCheckInFlight)
   return { text: markdownWaiting(report, await keep($, report)) }
+}
+
+async function setCanSend($: EngineInterface, id: string, canSend: boolean) {
+  await update($, reports, all => {
+    const r = all?.[id]
+    return r?.type === 'waiting' ? { ...all, [id]: { ...r, canSend } } : (all ?? {})
+  })
+}
+
+/* The check message, sent once per press: the card stops offering it, and no card offers
+   it again until a turn completes or the message does not enter. */
+async function sendCheck($: EngineInterface, id: string) {
+  if (isCheckInFlight) return
+  isCheckInFlight = true
+  await setCanSend($, id, false)
+  const fail = async (reason: string) => {
+    isCheckInFlight = false
+    $.ui.log(`usage-dollars: check message: ${reason}`, { to: 'debug' })
+    await setCanSend($, id, true)
+  }
+  void $.prompt.submit({ text: CHECK_PROMPT }).then(
+    result => (result.drop !== undefined ? fail('dropped') : undefined),
+    error => fail(String(error)),
+  )
 }
 
 /* The helper's range arguments for a report form, or undefined when the form is not one. */
@@ -128,6 +157,11 @@ export const register: Register = on => {
     const receivedAt = await $.clock.now()
     const isFresh = e.changed.includes('cost') || e.changed.includes('rateLimits')
     void measureThen($, e.rateLimits, e.changed.includes('rateLimits'), isFresh, receivedAt)
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    isCheckInFlight = false
     return next(e)
   })
 
@@ -199,7 +233,7 @@ export const register: Register = on => {
     if (r?.type === 'check' && Array.isArray(r.items)) return checkCard(ui, r)
     if (r?.type === 'calibration' && Array.isArray(r.windows)) return calibrationCard(ui, r)
     if (r?.type === 'guide' && Array.isArray(r.sections)) return guideCard(ui, r)
-    if (r?.type === 'waiting') return waitingCard(ui, r)
+    if (r?.type === 'waiting' && id) return waitingCard(ui, r, () => void sendCheck($, id))
     return next(e)
   })
 }
