@@ -1,0 +1,25 @@
+{
+  "oauthAccount": {
+    "accountUuid": "00000000-0000-4000-8000-0000000000aa",
+    "emailAddress": "nobody@example.invalid",
+    "organizationUuid": "00000000-0000-4000-8000-000000000001",
+    "billingType": "stripe_subscription",
+    "subscriptionCreatedAt": "2026-09-01T08:00:00.000Z",
+    "seatTier": "",
+    "displayName": "Dummy Display",
+    "fullName": "Dummy Full Name",
+    "profileFetchedAt": 1791021600000,
+    "organizationType": "claude_max",
+    "organizationRateLimitTier": "default_claude_max_5x",
+    "userRateLimitTier": "",
+    "organizationName": "Dummy Organization"
+  },
+  "cachedGrowthBookFeatures": {
+    "tengu_rate_limit_promo_notices": [
+      {
+        "text": "Double 5-hour limits through Oct 13",
+        "bar": "5h"
+      }
+    ]
+  }
+}

@@ -1,7 +1,7 @@
 {
   "name": "usage-dollars",
-  "version": "0.3.0",
-  "description": "Shows subscription usage for the 5-hour window and the week as API-equivalent dollars: used, left and allowance with 90% ranges",
+  "version": "0.4.0",
+  "description": "Shows subscription usage for the 5-hour window and the week as API-equivalent dollars: estimated allowance first, then left and used, with 90% ranges; spending reports by date range",
   "author": { "name": "Hyvän Mielen Pelit" },
   "types": "./types/index.d.ts"
 }
