@@ -45,6 +45,7 @@ been opened since.
 | Command | Shows |
 |---|---|
 | `/usage-dollars` | The window card: plan, notices, each window's allowance first, then used, left, the next tick, and spending per model |
+| `/usage-dollars help` | The [guide](usage-dollars/GUIDE.md): every command, setup, reading the card, calibration, the setup check, troubleshooting |
 | `/usage-dollars report` | Spending in the last 24 hours, per day and per model |
 | `/usage-dollars 24h`, `/usage-dollars 7d` | Spending in the last N hours or days, up to 90 days |
 | `/usage-dollars today` | Spending since local midnight |
@@ -52,17 +53,41 @@ been opened since.
 | `/usage-dollars 2026-10-01..2026-10-05` | Spending over local days, both inclusive |
 | `/usage-dollars reset` | Restarts the estimates for this subscription (see below) |
 | `/usage-dollars reset undo` | Undoes the latest reset |
+| `/usage-dollars check` | A setup check: the helper, the subscription, other sessions' hooks and price table, this session's readings, the prices; each ✓, ✗ with the fix, or ℹ |
+| `/usage-dollars calibrate` | What each window's estimate rests on: percent levels and ticks read, whether each spread and the rounding rule are measured and from how many windows, the current range |
 
 The window card is allowance-first: a headline row gives each window's estimated allowance,
 its 90% range and a confidence label (`good` within about ±10%, `fair` within ±30%,
-`rough` beyond). Each window then shows what is used and what is left, a bar of used
-dollars against the allowance range, the percent the estimate rests on ("Limit reports 10%
-· read 2 min ago"), and "next tick": about how many more dollars until the reported percent
-moves again. Before the first estimate a window reads "estimating…"; no dollar figure can be
-given until the limit reports a higher percent.
+`rough` beyond), followed by "calibrated" once both spreads and the rounding rule are
+measured. Each window then shows what is used and what is left, a bar of used dollars
+against the allowance range, the percent the estimate rests on ("Limit reports 10% · read
+2 min ago"), and "next tick": about how many more dollars until the reported percent moves
+again. Before the first estimate a window reads "estimating…"; the first estimate follows
+the first reply.
 
 A spending report covers only as far back as this machine's transcripts do. When the range
 starts earlier, the report says where the transcripts begin.
+
+### Getting rigorous estimates
+
+The [guide](usage-dollars/GUIDE.md), also shown by `/usage-dollars help`, covers these steps in detail, with what each line of
+`check` and `calibrate` means, how long calibration takes, and what to do when something
+changes.
+
+1. **Load one copy, then restart every session.** Sessions that started before an update
+   keep running the old hooks and can lose readings.
+2. **Run `/usage-dollars check`** and fix every ✗.
+3. **Use Claude Code as you would anyway.** A reading is taken after every reply in any
+   session of the subscription. The first ranges are wide, because both spreads are still
+   assumptions; they narrow as the percent ticks over and as windows close.
+4. **Run `/usage-dollars calibrate`** to see what has been measured. Every closed window
+   that reached 10% counts, weighted by how much it says; a window that hit the limit
+   counts in full. Light use calibrates more slowly. A window reads "Calibrated" once the
+   within-window spread rests on 2 closed windows, the between-window spread on about 3
+   past windows' worth of information, and the rounding rule on 5 closed windows.
+5. **After a plan change or a promotion** the card says so, or run `/usage-dollars reset`;
+   calibration starts again from the next window. A change of the price table does the
+   same.
 
 ### The plan line and plan changes
 
@@ -118,13 +143,14 @@ promotion change can no longer be undone.
   per-session costs it usually comes within a few percent, and up to a quarter low on long
   sessions, because some billed calls never reach a transcript.
 - **Readings.** The API reports the window's usage in whole percent, and the percent a
-  response carries includes that response. A reading is taken only when this session has
-  just received the percent, and pairs it with the dollars counted up to the moment it
-  arrived, not up to when the scan runs. Another session's request in the 30 seconds
-  before that moment may or may not be in the percent yet; its dollars are kept with the
-  reading as slack. Running sessions share the freshest percent between them. No reading
-  is taken while more than 2% of a window's requests go to unpriced models, and readings
-  priced with an older price table are dropped.
+  response carries includes that response. A reading is taken when this session has just
+  received the percent, and pairs it with the dollars counted up to the moment it arrived,
+  not up to when the scan runs. Another session's request in the 30 seconds before that
+  moment may or may not be in the percent yet; its dollars are kept with the reading as
+  slack. Running sessions share the freshest percent between them, and a reading is also
+  taken for a percent another session stored without one, with the dollars up to when
+  that session received it. No reading is taken while more than 2% of a window's requests
+  go to unpriced models, and readings priced with an older price table are dropped.
 - **Allowance** rests on the newest percent level. When the level below it was read too,
   the percent ticked over between those two readings, and the dollars at that moment
   divided by the share at the tick give the dollars per percent; otherwise the share
@@ -144,8 +170,9 @@ promotion change can no longer be undone.
   omega from how far the dollars per percent at each tick of a closed window strayed from
   its end, tau from the scatter of past allowances. The card's basis line says which is
   assumed and which measured. Past windows come from the mod's own readings of closed
-  windows that reached half way and from rate-limit rejections in the last 14 days of
-  transcripts, each a window seen exactly full; a window seen both ways counts once.
+  windows that reached 10%, each weighted by how much it says, and from rate-limit
+  rejections in the last 14 days of transcripts, each a window seen exactly full; a window
+  seen both ways counts once.
   Older windows count for less: a past 5-hour window loses half its weight every day, a
   past week every 14 days, so the estimate follows a change of limits quickly. The card's
   "history weight" is the effective number of past windows behind the prior.
@@ -165,7 +192,10 @@ second with the assumed omega:
 
 Past windows narrow the early figures further. In the simulation the range holds the true
 allowance 89% to 96% of the time from 3% used on, when the rounding rule is known, and
-somewhat more often while it is not.
+somewhat more often while it is not (scenarios S1 to S4). Past windows that closed short of
+their limit err on the wide side: closed at 10% to 60% used (S7), the range holds the
+truth 96% to 98% of the time; with an allowance that varies 20% between windows and past
+windows closed at 10% to 20% (S9), 88% at 3% used and 96% to 100% from 10% on.
 
 Upgrading from 0.3.0 restarts the estimates once: the readings it kept cannot be attributed
 to a subscription. Upgrading from 0.4.0 drops the stored readings once: some paired a
@@ -179,8 +209,13 @@ kept.
   and makes the allowance look smaller than it is.
 - The model assumes the dollars per percent vary from request to request independently.
   When the mix of work stays expensive or cheap for long stretches (say, one model for an
-  hour, then another), the early range is too narrow: in the simulation it holds the true
-  allowance about 85% of the time rather than 90%.
+  hour, then another), the range is too narrow: in the simulation, with the within-window
+  spread measured, it holds the true allowance 85% to 94% of the time when past windows
+  ran to their limit (S5), and 81% to 89% when they closed at 10% to 60% used (S8), rather
+  than 90%; less while that spread is still assumed.
+- Before the within-window spread is measured, a subscription whose allowance varies
+  between windows much more than 10% can see early ranges (at a few percent used) hold
+  the truth about 80% of the time.
 - Model prices live in [`scripts/usage-cost.mjs`](usage-dollars/scripts/usage-cost.mjs).
   A model missing there is reported as unpriced, never guessed; add new models as they
   ship.
@@ -192,11 +227,12 @@ kept.
 | Path | Role |
 |---|---|
 | `.claude-plugin/plugin.json` | Manifest |
+| `GUIDE.md` | Commands, setup, best practices, calibration and troubleshooting, step by step; shown by `/usage-dollars help` |
 | `hooks/register.tsx` | Hooks: events, the `/usage-dollars` command forms, toasts |
 | `hooks/measure.ts` | The scan, stored readings and plan history per subscription, the estimates |
 | `hooks/estimate.ts` | Allowance estimate, its 90% range, rounding inference, next tick |
 | `hooks/plan.ts` | Plan ledger, promotions, regimes, reset and undo |
-| `hooks/card.tsx` | The window and report cards, their Markdown fallbacks, the status line |
+| `hooks/card.tsx` | The window, report, check, calibration and guide cards, their Markdown fallbacks, the status line |
 | `scripts/usage-cost.mjs` | Transcript scan, pricing, the profile, date labels (Node) |
 | `types/index.d.ts` | Type contract for the mod's session state |
 | `tests/*.test.ts` | Unit tests: `claude plugin test usage-dollars` (see below) |

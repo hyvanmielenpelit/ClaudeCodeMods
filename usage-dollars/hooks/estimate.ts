@@ -40,9 +40,10 @@ export type Rejection = { kind: string; resetsAt: string; at: string; usd: numbe
     crossingUsd: the dollars at the tick into that level, when it was seen. */
 export type Evidence = { logA: number; variance: number; shift: number; share: number; pct: number; crossingUsd?: number }
 
-/** The within-window spread omega, and the age weight of the closed-window crossings
-    behind it. */
-export type Spread = { omega: number; weight: number; isAssumed: boolean }
+/** The within-window spread omega, the age weight of the closed-window crossings behind
+    it, and the number of closed windows that gave a crossing. It counts as measured from
+    two windows on. */
+export type Spread = { omega: number; weight: number; windows: number; isAssumed: boolean }
 
 export type Estimate = {
   allowance: RangeEstimate
@@ -73,15 +74,16 @@ const NU0 = 4
 const TAU0 = 0.1
 const OMEGA0 = 0.5
 const REJECTION_SD = 0.02
-const MIN_PAST_SHARE = 50
+const MIN_PAST_SHARE = 10
 const MIN_CROSSING_SHARE = 5
-const MIN_ROUNDING_WINDOWS = 5
+const MIN_SPREAD_WINDOWS = 2
+export const MIN_ROUNDING_WINDOWS = 5
 const MINUTE_MS = 60 * 1000
 const HOUR_MS = 60 * MINUTE_MS
 const FIVE_HOUR_HALF_LIFE_MS = 24 * HOUR_MS
 const SEVEN_DAY_HALF_LIFE_MS = 14 * 24 * HOUR_MS
 
-export const ASSUMED_SPREAD: Spread = { omega: OMEGA0, weight: 0, isAssumed: true }
+export const ASSUMED_SPREAD: Spread = { omega: OMEGA0, weight: 0, windows: 0, isAssumed: true }
 
 export function resolutionOf(all: readonly WindowReadings[]) {
   const isFine = all.some(w => Object.keys(w.byPct).some(p => !Number.isInteger(Number(p))))
@@ -202,9 +204,10 @@ export function evidenceOf(w: WindowReadings, resolution: number, rounding: Roun
   return undefined
 }
 
-/** A closed window as a past allowance: its final evidence, once it reached half way. */
-export function pastOf(w: WindowReadings, resolution: number, rounding: Rounding): PastPoint | undefined {
-  const e = evidenceOf(w, resolution, rounding)
+/** A closed window as a past allowance: its final evidence, with the within-window term
+    of where it stopped, once it reached 10%. */
+export function pastOf(w: WindowReadings, resolution: number, rounding: Rounding, omega: number): PastPoint | undefined {
+  const e = evidenceOf(w, resolution, rounding, omega)
   if (!e || e.share < MIN_PAST_SHARE) return undefined
   return { logA: e.logA, variance: e.variance + e.shift ** 2, at: Date.parse(w.resetsAt) }
 }
@@ -219,11 +222,12 @@ export function pastPoints(
   kind: string,
   resolution: number,
   rounding: Rounding,
+  omega: number,
 ): PastPoint[] {
   const byWindow = new Map<number, PastPoint>()
   for (const w of closed) {
     if (w.kind !== kind) continue
-    const p = pastOf(w, resolution, rounding)
+    const p = pastOf(w, resolution, rounding, omega)
     if (p) byWindow.set(minuteOf(w.resetsAt), p)
   }
   const rejected = new Map<number, PastPoint>()
@@ -243,38 +247,48 @@ export function weightOf(kind: string, ageMs: number) {
   return 0.5 ** (Math.max(0, ageMs) / halfLife)
 }
 
-/** The age-weighted mean of past log allowances; tau², their spread beyond their own
+/** The weighted mean of past log allowances; tau², their spread beyond their own
     measurement variance, shrunk toward the assumed TAU0 with NU0 degrees of freedom; and
-    the predictive variance of the next window's log allowance. */
+    the predictive variance of the next window's log allowance. A point weighs by its age
+    and by its information q = TAU0² / (TAU0² + v): one whose own variance v is large
+    beside the assumed tau² says little about the allowance or about tau. */
 export function prior(past: readonly PastPoint[], kind: string, now: number) {
+  const points = past.map(p => {
+    const q = TAU0 ** 2 / (TAU0 ** 2 + p.variance)
+    return { x: p.logA, v: p.variance, q, w: weightOf(kind, now - p.at) * q }
+  })
   let sw = 0
   let sw2 = 0
   let swx = 0
-  let swv = 0
-  for (const p of past) {
-    const w = weightOf(kind, now - p.at)
-    sw += w
-    sw2 += w * w
-    swx += w * p.logA
-    swv += w * p.variance
+  let swq2 = 0
+  for (const p of points) {
+    sw += p.w
+    sw2 += p.w * p.w
+    swx += p.w * p.x
+    swq2 += p.w * p.q * p.q
   }
   const nEff = sw2 > 0 ? (sw * sw) / sw2 : 0
   const mean = sw > 0 ? swx / sw : 0
-  const pointVariance = sw > 0 ? swv / sw : 0
-  let s2 = 0
+  let raw = 0
   const denominator = sw > 0 ? sw - sw2 / sw : 0
   if (denominator > 0) {
     let ss = 0
-    for (const p of past) ss += weightOf(kind, now - p.at) * (p.logA - mean) ** 2
-    s2 = ss / denominator
+    let noise = 0
+    for (const p of points) {
+      ss += p.w * (p.x - mean) ** 2
+      noise += p.w * p.v * (1 - p.w / sw)
+    }
+    raw = (ss - noise) / denominator
   }
-  const extra = Math.max(0, nEff - 1)
-  const tau2 = (NU0 * TAU0 ** 2 + extra * Math.max(0, s2 - pointVariance)) / (NU0 + extra)
-  const variance = nEff > 0 ? tau2 + (tau2 + pointVariance) / nEff : Infinity
-  return { nEff, mean, tau2, variance, df: NU0 + extra, isUsable: nEff >= 1, isSpreadAssumed: nEff < 3, points: past.length }
+  const extra = sw > 0 ? Math.max(0, nEff - 1) * (swq2 / sw) : 0
+  const tau2 = (NU0 * TAU0 ** 2 + extra * Math.max(0, raw)) / (NU0 + extra)
+  let spread = 0
+  for (const p of points) spread += p.w * p.w * (tau2 + p.v)
+  const variance = sw > 0 ? tau2 + spread / (sw * sw) : Infinity
+  return { nEff, mean, tau2, variance, df: NU0 + extra, isUsable: nEff >= 1, isSpreadAssumed: 1 + extra < 3, points: past.length }
 }
 
-/** omega from closed windows that reached half way: each tick crossed at share s in
+/** omega from closed windows that reached 10%: each tick crossed at share s in
     [5, sEnd/2] gives e = log(U/s) − log(U_end/sEnd), with E[e²] = omega² · (1/s − 1/sEnd).
     Age-weighted, and shrunk toward OMEGA0 with the weight of NU0 crossings. */
 export function calibrateOmega(
@@ -286,11 +300,13 @@ export function calibrateOmega(
 ): Spread {
   let sum = 0
   let weight = 0
+  let windows = 0
   for (const w of closed) {
     const end = evidenceOf(w, resolution, rounding)
     if (!end || end.share < MIN_PAST_SHARE) continue
     const age = weightOf(kind, now - Date.parse(w.resetsAt))
     const levels = levelsOf(w)
+    let isCounted = false
     for (const level of levels) {
       const crossing = crossingOf(levels, level, resolution)
       if (!crossing || !(crossing.usd > 0)) continue
@@ -299,9 +315,11 @@ export function calibrateOmega(
       const e = Math.log(crossing.usd / s) - (end.logA - Math.log(100))
       sum += (age * e * e) / (1 / s - 1 / end.share)
       weight += age
+      isCounted = true
     }
+    if (isCounted) windows++
   }
-  return { omega: Math.sqrt((NU0 * OMEGA0 ** 2 + sum) / (NU0 + weight)), weight, isAssumed: weight === 0 }
+  return { omega: Math.sqrt((NU0 * OMEGA0 ** 2 + sum) / (NU0 + weight)), weight, windows, isAssumed: windows < MIN_SPREAD_WINDOWS }
 }
 
 /** Student's t quantile by the Cornish-Fisher expansion in 1/df to third order. */
@@ -338,7 +356,7 @@ function normalQuantile(p: number) {
    contradicted in at most 10% of at least 5 windows while the other is contradicted in at
    least half of them. The caller leaves out windows that straddle a regime start; a
    window that is inconsistent even under the union is ignored here. */
-export function inferRounding(windows: readonly WindowReadings[], resolution: number): Rounding {
+export function roundingEvidence(windows: readonly WindowReadings[], resolution: number) {
   /* A reading exactly on a boundary makes low equal high, up to floating-point noise. */
   const isEmpty = (b: { low: number; high: number }) => b.low > b.high * (1 + 1e-9)
   let considered = 0
@@ -354,11 +372,50 @@ export function inferRounding(windows: readonly WindowReadings[], resolution: nu
     if (isEmpty(round)) roundConflicts++
     if (isEmpty(truncate)) truncateConflicts++
   }
-  if (considered < MIN_ROUNDING_WINDOWS) return 'union'
-  if (roundConflicts <= 0.1 * considered && truncateConflicts >= 0.5 * considered) return 'round'
-  if (truncateConflicts <= 0.1 * considered && roundConflicts >= 0.5 * considered) return 'truncate'
-  return 'union'
+  let rule: Rounding = 'union'
+  if (considered >= MIN_ROUNDING_WINDOWS) {
+    if (roundConflicts <= 0.1 * considered && truncateConflicts >= 0.5 * considered) rule = 'round'
+    else if (truncateConflicts <= 0.1 * considered && roundConflicts >= 0.5 * considered) rule = 'truncate'
+  }
+  return { considered, roundConflicts, truncateConflicts, rule }
 }
+
+export function inferRounding(windows: readonly WindowReadings[], resolution: number): Rounding {
+  return roundingEvidence(windows, resolution).rule
+}
+
+/** What has been measured for one window: the current window's levels and ticks, and
+    whether each of the within-window spread, the between-window spread and the rounding
+    rule rests on closed windows rather than on an assumption. */
+export function calibrationOf(input: {
+  current?: WindowReadings
+  resolution: number
+  spread: Spread
+  prior: ReturnType<typeof prior>
+  rounding: ReturnType<typeof roundingEvidence>
+}) {
+  const levels = input.current ? levelsOf(input.current) : []
+  const ticks = levels.filter(level => crossingOf(levels, level, input.resolution) !== undefined).length
+  const isWithinMeasured = !input.spread.isAssumed
+  const isBetweenMeasured = !input.prior.isSpreadAssumed
+  const isRoundingKnown = input.rounding.rule !== 'union'
+  const measured = [isWithinMeasured, isBetweenMeasured, isRoundingKnown].filter(Boolean).length
+  return {
+    levels: levels.length,
+    ticks,
+    closedForWithin: input.spread.windows,
+    isWithinMeasured,
+    pastPoints: input.prior.points,
+    pastWeight: Math.round(input.prior.nEff * 10) / 10,
+    isBetweenMeasured,
+    closedForRounding: input.rounding.considered,
+    isRoundingKnown,
+    measured,
+    isCalibrated: measured === 3,
+  }
+}
+
+export type Calibration = ReturnType<typeof calibrationOf>
 
 export function confidenceOf(r: RangeEstimate): Confidence {
   const h = Math.sqrt(r.high / r.low) - 1

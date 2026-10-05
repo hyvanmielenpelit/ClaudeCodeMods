@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { compact, statusLine } from '../hooks/card'
+import { compact, guideSections, markdownGuide, statusLine } from '../hooks/card'
 
 const range = (value: number) => ({ value, low: value * 0.9, high: value * 1.1 })
 
@@ -26,6 +26,20 @@ test('nothing left reads as at limit', () => {
 
 test('an unseen plan change leads the line', () => {
   expect(statusLine([{ short: '5h', usedUsd: 40 }], true)).toBe('⚠ Plan changed · 5h $40 used, estimating')
+})
+
+test('the guide splits before each level-2 heading, without carriage returns', () => {
+  const sections = guideSections('# Guide\r\n\r\nIntro.\r\n\r\n## Commands\r\n\r\n| a | b |\r\n\r\n### Detail\r\n\r\nText.\r\n\r\n## Setup\r\n\r\n1. One\r\n')
+  expect(sections).toEqual(['# Guide\n\nIntro.', '## Commands\n\n| a | b |\n\n### Detail\n\nText.', '## Setup\n\n1. One'])
+  expect(markdownGuide({ type: 'guide', sections }, '7').endsWith('[//]: # (usage-dollars:report:7)')).toBe(true)
+})
+
+test('a guide section longer than one Markdown element is split between paragraphs', () => {
+  const paragraph = 'x'.repeat(4000)
+  const sections = guideSections(`## Long\n\n${[paragraph, paragraph, paragraph].join('\n\n')}`)
+  expect(sections.length).toBe(2)
+  for (const s of sections) expect(s.length).toBeLessThanOrEqual(10000)
+  expect(sections.join('\n\n')).toBe(`## Long\n\n${[paragraph, paragraph, paragraph].join('\n\n')}`)
 })
 
 test('compact figures', () => {

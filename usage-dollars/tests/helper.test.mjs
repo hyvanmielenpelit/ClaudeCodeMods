@@ -211,6 +211,56 @@ test("slackUsd is other sessions' dollars of this subscription in the 30 s up to
     assert.ok(near(other.windows.session.slackUsd, 17), `slack ${other.windows.session.slackUsd}`);
 });
 
+test("a window's 5th field names the session whose requests are not slack", () =>
+{
+    const named = run(["--session", "session-a", "--window", `${SLACK_WINDOW},${SLACK_UNTIL},session-d`], "profile-max5x.json", SLACK_CONFIG).json;
+    assert.ok(near(named.windows.session.slackUsd, 17), `slack ${named.windows.session.slackUsd}`);
+    assert.ok(near(named.windows.session.usd, 23), `usd ${named.windows.session.usd}`);
+    const own = run(["--session", "session-a", "--window", `${SLACK_WINDOW},${SLACK_UNTIL},session-a`], "profile-max5x.json", SLACK_CONFIG).json;
+    assert.ok(near(own.windows.session.slackUsd, 2), `slack ${own.windows.session.slackUsd}`);
+    const bad = run(["--session", "session-a", "--window", `${SLACK_WINDOW},${SLACK_UNTIL},`], "profile-max5x.json", SLACK_CONFIG);
+    assert.equal(bad.status, 2);
+});
+
+test("--check-summary takes the largest cost-state per session and model, of at least $0.50", () =>
+{
+    const request = (session, id, model, usage) =>
+        JSON.stringify({ type: "assistant", sessionId: session, timestamp: "2026-10-04T12:00:00.000Z", requestId: id, message: { id: "msg-" + id, model, usage } });
+    const costState = (session, model, costUSD) => JSON.stringify({ type: "cost-state", sessionId: session, modelUsage: { [model]: { costUSD } } });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "usage-dollars-"));
+    try
+    {
+        const demo = path.join(dir, "projects", "demo");
+        fs.mkdirSync(demo, { recursive: true });
+        /* $4 against $4 (an earlier, smaller cost-state left out), $1 against $1.25, and $0.10 left out. */
+        fs.writeFileSync(path.join(demo, "s1.jsonl"), [
+            request("s1", "r1", "claude-opus-5-5", { input_tokens: 1000000, output_tokens: 0 }),
+            costState("s1", "claude-opus-5-5", 2),
+            costState("s1", "claude-opus-5-5", 4)
+        ].join("\n") + "\n");
+        fs.writeFileSync(path.join(demo, "s2.jsonl"), [
+            request("s2", "r2", "claude-haiku-4-5", { input_tokens: 1000000, output_tokens: 0 }),
+            costState("s2", "claude-haiku-4-5", 1.25)
+        ].join("\n") + "\n");
+        fs.writeFileSync(path.join(demo, "s3.jsonl"), [
+            request("s3", "r3", "claude-haiku-4-5", { input_tokens: 100000, output_tokens: 0 }),
+            costState("s3", "claude-haiku-4-5", 0.1)
+        ].join("\n") + "\n");
+        const out = run(["--check-summary"], "profile-max5x.json", dir).json;
+        assert.equal(out.sessions, 2);
+        assert.ok(near(out.medianRatio, 0.9), `median ${out.medianRatio}`);
+        assert.ok(near(out.lowRatio, 0.81), `low ${out.lowRatio}`);
+        assert.ok(near(out.highRatio, 0.99), `high ${out.highRatio}`);
+        assert.equal(typeof out.ms, "number");
+        const none = run(["--check-summary"], "profile-max5x.json", CONFIG).json;
+        assert.deepEqual({ ...none, ms: 0 }, { sessions: 0, medianRatio: null, lowRatio: null, highRatio: null, ms: 0 });
+    }
+    finally
+    {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test("pricesId is stable, and changes with a price", () =>
 {
     const args = ["--session", "session-a", "--window", SLACK_WINDOW];

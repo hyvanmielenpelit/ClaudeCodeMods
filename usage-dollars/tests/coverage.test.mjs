@@ -6,7 +6,9 @@
    Each request costs c dollars (lognormal, log-sd 1.0) and consumes c / (BASE · wf · rf)
    percent: wf is drawn once per window, rf per request, and kept for the next request
    with probability `persist`. The reported percent is the share rounded to a whole
-   percent, and includes the request just made. */
+   percent, and includes the request just made. With `close: [low, high]`, every past and
+   calibration window stops at a share drawn uniformly from that range, as windows of
+   light use close short of their limit. */
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -32,8 +34,14 @@ const SCENARIOS = [
     { id: "S3", sdWindow: 0.10, sdRequest: 0.3, persist: 0, past: 8, lead: 0 },
     { id: "S4", sdWindow: 0.20, sdRequest: 0.3, persist: 0, past: 4, lead: 0 },
     { id: "S5", sdWindow: 0.10, sdRequest: 0.4, persist: 0.98, past: 8, lead: 0 },
-    { id: "S6", sdWindow: 0, sdRequest: 0.3, persist: 0, past: 0, lead: 0.3 }
+    { id: "S6", sdWindow: 0, sdRequest: 0.3, persist: 0, past: 0, lead: 0.3 },
+    { id: "S7", sdWindow: 0.10, sdRequest: 0.3, persist: 0, past: 3, lead: 0, close: [10, 60], isUpperGated: false },
+    { id: "S8", sdWindow: 0.10, sdRequest: 0.4, persist: 0.98, past: 8, lead: 0, close: [10, 60] },
+    { id: "S9", sdWindow: 0.20, sdRequest: 0.3, persist: 0, past: 8, lead: 0, close: [10, 20], isUpperGated: false }
 ];
+
+/* Persistent mix: the model's assumption of independent requests does not hold. */
+const PERSISTENT = new Set(["S5", "S8"]);
 
 /* mulberry32, and normal deviates by Box-Muller. */
 function generator(seed)
@@ -77,11 +85,11 @@ function put(byPct, pct, usd, at, slack)
     return byPct;
 }
 
-/* One window, request by request, until the share reaches 100. `onReading` sees the
-   readings so far after each request. With `lead`, that share of readings counts one
-   request more in the dollars than in the percent, and passes that request's cost as the
-   reading's slack. */
-function simulateWindow(rng, s, resetsAt, onReading)
+/* One window, request by request, until the share reaches 100, or until a reading at a
+   share of at least `closeAt`, without a 100 level. `onReading` sees the readings so far
+   after each request. With `lead`, that share of readings counts one request more in the
+   dollars than in the percent, and passes that request's cost as the reading's slack. */
+function simulateWindow(rng, s, resetsAt, onReading, closeAt = 100)
 {
     const wf = Math.exp(s.sdWindow * rng.normal());
     let rf = Math.exp(s.sdRequest * rng.normal());
@@ -110,6 +118,8 @@ function simulateWindow(rng, s, resetsAt, onReading)
         put(byPct, reading.pct, reading.usd, at, slack);
         if (onReading)
             onReading(byPct, reading);
+        if (share >= closeAt)
+            return { truth: undefined, w: { kind: KIND, resetsAt: new Date(resetsAt).toISOString(), byPct } };
     }
 }
 
@@ -119,8 +129,10 @@ const snapshot = (byPct, resetsAt) => ({
     byPct: Object.fromEntries(Object.entries(byPct).map(([k, b]) => [k, { ...b }]))
 });
 
+const closeAtOf = (rng, s) => (s.close ? s.close[0] + (s.close[1] - s.close[0]) * rng.uniform() : 100);
+
 const closedWindows = (rng, s, n) =>
-    Array.from({ length: n }, (_, i) => simulateWindow(rng, s, NOW - (i + 1) * 5 * HOUR_MS, undefined).w);
+    Array.from({ length: n }, (_, i) => simulateWindow(rng, s, NOW - (i + 1) * 5 * HOUR_MS, undefined, closeAtOf(rng, s)).w);
 
 /* The estimator told that the API rounds, or under the union of both rules, as it is
    until closed windows show which one applies. */
@@ -135,7 +147,7 @@ function run(s, seed, rounding, windows)
         if (i % CALIBRATION_BLOCK === 0)
             spread = calibrateOmega(closedWindows(rng, s, CALIBRATION_WINDOWS), KIND, NOW, RESOLUTION, rounding);
         const past = closedWindows(rng, s, s.past)
-            .map(w => pastOf(w, RESOLUTION, rounding))
+            .map(w => pastOf(w, RESOLUTION, rounding, spread.omega))
             .filter(p => p !== undefined);
         const resetsAt = NOW + 5 * HOUR_MS;
         const pending = [];
@@ -176,20 +188,21 @@ const print = (label, rows) =>
     console.log(`${label} coverage, mean half-width: ` + rows.map(r => `${r.share}% ${(r.coverage * 100).toFixed(1)}% ±${(r.halfWidth * 100).toFixed(1)}%`).join(" · "));
 
 /* The lower gates always; the upper one only where the rounding rule is known, since the
-   union is wider than either rule by design. */
+   union is wider than either rule by design, and not where past windows closed short of
+   the limit, since their noisy points bias tau upward. */
 function gate(s, rows, label, isUpperChecked)
 {
     for (const r of rows)
     {
         const at = `${label} at ${r.share}%: ${(r.coverage * 100).toFixed(1)}%`;
-        if (s.id === "S5")
+        if (PERSISTENT.has(s.id))
             assert.ok(r.coverage >= 0.80, at);
         else if (r.share < 10)
             assert.ok(r.coverage >= 0.85, at);
         else
         {
             assert.ok(r.coverage >= 0.87, at);
-            if (isUpperChecked)
+            if (isUpperChecked && s.isUpperGated !== false)
                 assert.ok(r.coverage <= 0.96, at);
         }
     }

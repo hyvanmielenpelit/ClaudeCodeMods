@@ -1,9 +1,21 @@
-/* Drawing: the allowance-first window card, the spending report card, their Markdown
-   fallbacks, and the status line. Every date shown arrives already labeled by the helper. */
+/* Drawing: the allowance-first window card, the spending report card, the setup check,
+   calibration and guide cards, their Markdown fallbacks, and the status line. Every date
+   shown arrives already labeled by the helper. */
 
 import type { Elements, RenderSurface } from 'claude-code'
 
-import type { PlanReport, RangeReport, SpendReport, UsageReport, WindowReport } from '../types'
+import type {
+  CalibrationReport,
+  CalibrationWindow,
+  CheckItem,
+  CheckReport,
+  GuideReport,
+  PlanReport,
+  RangeReport,
+  SpendReport,
+  UsageReport,
+  WindowReport,
+} from '../types'
 
 type Ui = Elements[RenderSurface]
 
@@ -39,9 +51,12 @@ const FOOTNOTE =
   'how far dollars per percent vary within and between windows; see the README.'
 
 const FOOTER =
-  '/usage-dollars 24h · 7d · YYYY-MM-DD..YYYY-MM-DD for a spending report · /usage-dollars reset after a plan change'
+  '/usage-dollars 24h · 7d · YYYY-MM-DD..YYYY-MM-DD for a spending report · /usage-dollars reset after a plan change · ' +
+  '/usage-dollars help · check · calibrate'
 
-const NO_ESTIMATE = 'first estimate when the limit next reports a higher percent'
+const NO_ESTIMATE = 'first estimate after the next reply'
+
+const confidenceLabel = (w: WindowReport) => (w.confidence ? `${w.confidence}${w.isCalibrated ? ' · calibrated' : ''}` : '')
 
 export type StatusWindow = { short: string; usedUsd: number; allowance?: RangeReport; left?: RangeReport }
 
@@ -93,7 +108,7 @@ export function markdownWindows(r: UsageReport, id: string) {
     '|:--|--:|--:|:--|',
     ...r.windows.map(w =>
       w.allowance
-        ? `| ${w.title} | ~${money(w.allowance.value)} | ${span(w.allowance)} | ${w.confidence ?? ''} |`
+        ? `| ${w.title} | ~${money(w.allowance.value)} | ${span(w.allowance)} | ${confidenceLabel(w)} |`
         : `| ${w.title} | estimating… | | |`,
     ),
     '',
@@ -248,7 +263,7 @@ export function windowCard(ui: Ui, r: UsageReport, columns: number) {
       <Text dimColor>{headlineLabel(w)}</Text>
       <Text bold>{w.allowance ? `~${money(w.allowance.value)}` : 'estimating…'}</Text>
       <Text dimColor>{w.allowance ? span(w.allowance) : NO_ESTIMATE}</Text>
-      {w.allowance && w.confidence ? <Text dimColor>{w.confidence}</Text> : undefined}
+      {w.allowance && w.confidence ? <Text dimColor>{confidenceLabel(w)}</Text> : undefined}
     </Box>
   )
 
@@ -386,6 +401,140 @@ export function spendCard(ui: Ui, r: SpendReport, columns: number) {
       {modelTable(ui, 'By model', r.byModel)}
 
       {notesBlock(ui, r.notes)}
+    </Box>
+  )
+}
+
+const MARK_OF: Record<CheckItem['state'], string> = { ok: '✓', fail: '✗', info: 'ℹ' }
+
+const COLOR_OF: Record<CheckItem['state'], string | undefined> = { ok: 'green', fail: 'red', info: undefined }
+
+export function markdownCheck(r: CheckReport, id: string) {
+  return [
+    '### Setup check · usage-dollars',
+    '',
+    ...r.items.map(item => `- ${MARK_OF[item.state]} **${item.label}** · ${item.text}`),
+    '',
+    `[//]: # (usage-dollars:report:${id})`,
+  ].join('\n')
+}
+
+export function checkCard(ui: Ui, r: CheckReport) {
+  const { Box, Text } = ui
+  return (
+    <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={2} paddingY={1} rowGap={1}>
+      <Box flexDirection="row" columnGap={1}>
+        <Text bold>Setup check</Text>
+        <Text dimColor>· usage-dollars</Text>
+      </Box>
+      {r.items.map(item => (
+        <Box flexDirection="row" columnGap={1}>
+          <Box width={2}>
+            <Text color={COLOR_OF[item.state]} dimColor={item.state === 'info'}>
+              {MARK_OF[item.state]}
+            </Text>
+          </Box>
+          <Box width={12}>
+            <Text bold>{item.label}</Text>
+          </Box>
+          <Box flexGrow={1} flexShrink={1}>
+            <Text>{item.text}</Text>
+          </Box>
+        </Box>
+      ))}
+    </Box>
+  )
+}
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
+
+/* Facts about the data behind one window's estimate, never what to do about them. */
+function calibrationLines(w: CalibrationWindow) {
+  const lines = [`This window: ${plural(w.levels, 'percent level')} read, ${plural(w.ticks, 'tick')} seen`]
+  if (w.closedWindows === 0) lines.push('No closed window with readings yet')
+  lines.push(
+    w.isWithinMeasured
+      ? `Within-window spread: measured, from ${plural(w.closedForWithin, 'closed window')}`
+      : `Within-window spread: assumed; ${plural(w.closedForWithin, 'closed window')} with a tick, 2 needed`,
+    `Between-window spread: ${w.isBetweenMeasured ? 'measured' : 'assumed'}; ` +
+      `${plural(w.pastPoints, 'past window')} (rejections included), history weight ${w.pastWeight}`,
+    w.isRoundingKnown
+      ? `Rounding rule: known (the API ${w.rounding === 'round' ? 'rounds' : 'truncates'}), from ${plural(w.closedForRounding, 'closed window')}`
+      : `Rounding rule: not known; ${w.closedForRounding} of ${w.roundingNeeded} closed windows needed`,
+  )
+  if (w.halfWidth !== undefined) lines.push(`90% range now: ±${Math.round(w.halfWidth * 100)}%`)
+  return lines
+}
+
+const calibrationStatus = (w: CalibrationWindow) => (w.isCalibrated ? 'Calibrated' : `Calibrating: ${w.measured} of 3 measured`)
+
+export function markdownCalibration(r: CalibrationReport, id: string) {
+  const lines = ['### Calibration · usage-dollars', '']
+  for (const w of r.windows)
+    lines.push(`**${w.title}** · ${calibrationStatus(w)}`, '', ...calibrationLines(w).map(line => `- ${line}`), '')
+  lines.push(`[//]: # (usage-dollars:report:${id})`)
+  return lines.join('\n')
+}
+
+export function calibrationCard(ui: Ui, r: CalibrationReport) {
+  const { Box, Text } = ui
+  return (
+    <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={2} paddingY={1} rowGap={2}>
+      <Box flexDirection="row" columnGap={1}>
+        <Text bold>Calibration</Text>
+        <Text dimColor>· usage-dollars</Text>
+      </Box>
+      {r.windows.map(w => (
+        <Box flexDirection="column">
+          <Box flexDirection="row" justifyContent="space-between" flexWrap="wrap" columnGap={2}>
+            <Text bold>{w.title}</Text>
+            <Text color={w.isCalibrated ? 'green' : undefined} dimColor={!w.isCalibrated}>
+              {calibrationStatus(w)}
+            </Text>
+          </Box>
+          {calibrationLines(w).map(line => (
+            <Text>{line}</Text>
+          ))}
+        </Box>
+      ))}
+    </Box>
+  )
+}
+
+/* What one Markdown element draws at most. */
+const MAX_MARKDOWN = 10000
+
+/** The guide's text in sections that each fit one Markdown element: split before every
+    level-2 heading, and a longer section between paragraphs. Carriage returns, which the
+    element refuses, are dropped. */
+export function guideSections(text: string) {
+  const sections: string[] = []
+  for (const section of text.replace(/\r/g, '').split(/\n(?=## )/)) {
+    let chunk = ''
+    for (const paragraph of section.split(/\n{2,}/)) {
+      const next = chunk ? `${chunk}\n\n${paragraph}` : paragraph
+      if (next.length <= MAX_MARKDOWN) chunk = next
+      else {
+        if (chunk) sections.push(chunk)
+        chunk = paragraph.slice(0, MAX_MARKDOWN)
+      }
+    }
+    if (chunk.trim()) sections.push(chunk.trim())
+  }
+  return sections
+}
+
+export function markdownGuide(r: GuideReport, id: string) {
+  return [...r.sections, `[//]: # (usage-dollars:report:${id})`].join('\n\n')
+}
+
+export function guideCard(ui: Ui, r: GuideReport) {
+  const { Box, Markdown } = ui
+  return (
+    <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={2} paddingY={1} rowGap={1}>
+      {r.sections.map(text => (
+        <Markdown text={text} />
+      ))}
     </Box>
   )
 }

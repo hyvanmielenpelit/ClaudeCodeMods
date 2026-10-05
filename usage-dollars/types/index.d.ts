@@ -24,6 +24,8 @@ export type WindowReport = {
   /** Minutes since that percent was received. */
   percentAgeMinutes?: number
   basis: string
+  /** Both spreads and the rounding rule rest on closed windows. */
+  isCalibrated?: boolean
 }
 
 export type PlanReport = {
@@ -64,8 +66,53 @@ export type SpendReport = {
   notes: string[]
 }
 
+export type CheckItem = { label: string; state: 'ok' | 'fail' | 'info'; text: string }
+
+export type CheckReport = {
+  type: 'check'
+  items: CheckItem[]
+}
+
+/** What has been measured for one window. */
+export type CalibrationWindow = {
+  title: string
+  /** Percent levels read in the current window, and how many of them with a tick. */
+  levels: number
+  ticks: number
+  /** Closed windows of this kind, since the latest restart, that hold readings. */
+  closedWindows: number
+  /** Closed windows that gave the within-window spread a crossing; measured from 2. */
+  closedForWithin: number
+  isWithinMeasured: boolean
+  /** Past windows behind the prior, rejections included, and their effective weight. */
+  pastPoints: number
+  pastWeight: number
+  isBetweenMeasured: boolean
+  /** Closed windows of every subscription that could show the rounding rule. */
+  closedForRounding: number
+  roundingNeeded: number
+  isRoundingKnown: boolean
+  rounding: 'round' | 'truncate' | 'union'
+  /** Of the three above. */
+  measured: number
+  isCalibrated: boolean
+  /** Of the current 90% range, in proportion: 0.12 for ±12%. */
+  halfWidth?: number
+}
+
+export type CalibrationReport = {
+  type: 'calibration'
+  windows: CalibrationWindow[]
+}
+
+/** The guide, as Markdown sections that each fit one Markdown element. */
+export type GuideReport = {
+  type: 'guide'
+  sections: string[]
+}
+
 declare module 'claude-code' {
   interface PluginState {
-    'usage-dollars': { reports: Record<string, UsageReport | SpendReport> }
+    'usage-dollars': { reports: Record<string, UsageReport | SpendReport | CheckReport | CalibrationReport | GuideReport> }
   }
 }

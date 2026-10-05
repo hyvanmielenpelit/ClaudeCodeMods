@@ -1,9 +1,33 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
-import type { SpendReport, UsageReport } from '../types'
-import { markdownSpend, markdownWindows, spendCard, windowCard } from './card'
-import { markNoticesSeen, refresh, refreshHistory, resetEstimates, spendReport, statusOf, takeToasts, toReport, undoReset } from './measure'
+import type { CalibrationReport, CheckReport, GuideReport, SpendReport, UsageReport } from '../types'
+import {
+  calibrationCard,
+  checkCard,
+  guideCard,
+  guideSections,
+  markdownCalibration,
+  markdownCheck,
+  markdownGuide,
+  markdownSpend,
+  markdownWindows,
+  spendCard,
+  windowCard,
+} from './card'
+import {
+  checkReport,
+  markNoticesSeen,
+  refresh,
+  refreshHistory,
+  resetEstimates,
+  spendReport,
+  statusOf,
+  takeToasts,
+  toCalibrationReport,
+  toReport,
+  undoReset,
+} from './measure'
 import type { Host } from './measure'
 
 const HOUR_MS = 60 * 60 * 1000
@@ -12,7 +36,12 @@ const KEPT_REPORTS = 20
 const MARK = /usage-dollars:report:(\d+)/
 
 const USAGE =
-  'Usage: /usage-dollars [report | <N>h | <N>d | today | YYYY-MM-DD | YYYY-MM-DD..YYYY-MM-DD | reset | reset undo]'
+  'Usage: /usage-dollars [help | check | calibrate | report | <N>h | <N>d | today | YYYY-MM-DD | YYYY-MM-DD..YYYY-MM-DD | reset | reset undo]' +
+  ' · /usage-dollars help explains each one.'
+
+const GUIDE_FILE = 'GUIDE.md'
+
+const NO_FIGURES = 'No usage figures yet: they appear after the first reply in this session.'
 
 const reports = atom({ plugin: 'usage-dollars', key: 'reports' } as const, {})
 
@@ -43,7 +72,7 @@ function measureThen($: EngineInterface, limits?: readonly SessionRateLimit[], i
   })
 }
 
-async function keep($: EngineInterface, report: UsageReport | SpendReport) {
+async function keep($: EngineInterface, report: UsageReport | SpendReport | CheckReport | CalibrationReport | GuideReport) {
   const id = String(Date.now())
   await update($, reports, all => {
     const kept = Object.entries(all ?? {}).slice(-(KEPT_REPORTS - 1))
@@ -74,8 +103,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'usage-dollars',
-      description: 'Subscription usage in API-equivalent dollars: allowance, spending reports, reset',
-      argumentHint: '[report | 24h | 7d | today | YYYY-MM-DD[..YYYY-MM-DD] | reset [undo]]',
+      description: 'Subscription usage in API-equivalent dollars: allowance, calibration, spending reports, reset; "help" for the guide',
+      argumentHint: '[help | check | calibrate | report | 24h | 7d | today | YYYY-MM-DD[..YYYY-MM-DD] | reset [undo]]',
     })
     void measureThen($, undefined, true)
     void refreshHistory(hostOf($)).catch(error => $.ui.log(`usage-dollars: history: ${String(error)}`, { to: 'debug' }))
@@ -97,7 +126,7 @@ export const register: Register = on => {
 
     if (args === '') {
       const summary = await measureThen($, undefined, true)
-      if (!summary) return { text: 'No usage figures yet: they appear after the first reply in this session.' }
+      if (!summary) return { text: NO_FIGURES }
       await markNoticesSeen(hostOf($))
       $.ui.status(statusOf(summary, false))
       const report = toReport(summary, await $.clock.now())
@@ -114,6 +143,29 @@ export const register: Register = on => {
     if (args === 'reset undo') {
       const isUndone = await undoReset(hostOf($))
       return { text: isUndone ? 'Reset undone.' : 'Nothing to undo.' }
+    }
+
+    if (args === 'help') {
+      let text: string
+      try {
+        text = await $.fs.read(`${$.plugin.root}/${GUIDE_FILE}`)
+      } catch (error) {
+        $.ui.log(`usage-dollars: help: ${String(error)}`, { to: 'debug' })
+        return { text: `The guide could not be read: ${GUIDE_FILE} is missing from the plugin folder.\n\n${USAGE}` }
+      }
+      const report: GuideReport = { type: 'guide', sections: guideSections(text) }
+      return { text: markdownGuide(report, await keep($, report)) }
+    }
+    if (args === 'check') {
+      const report = await checkReport(hostOf($))
+      await toastNotices($)
+      return { text: markdownCheck(report, await keep($, report)) }
+    }
+    if (args === 'calibrate') {
+      const summary = await measureThen($, undefined, true)
+      if (!summary) return { text: NO_FIGURES }
+      const report = toCalibrationReport(summary)
+      return { text: markdownCalibration(report, await keep($, report)) }
     }
 
     const range = reportRange(args, await $.clock.now())
@@ -133,6 +185,9 @@ export const register: Register = on => {
     const columns = e.viewport?.columns ?? 60
     if (r?.type === 'windows' && Array.isArray(r.windows)) return windowCard(ui, r, columns)
     if (r?.type === 'report' && Array.isArray(r.byDay)) return spendCard(ui, r, columns)
+    if (r?.type === 'check' && Array.isArray(r.items)) return checkCard(ui, r)
+    if (r?.type === 'calibration' && Array.isArray(r.windows)) return calibrationCard(ui, r)
+    if (r?.type === 'guide' && Array.isArray(r.sections)) return guideCard(ui, r)
     return next(e)
   })
 }

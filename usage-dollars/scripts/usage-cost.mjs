@@ -4,10 +4,11 @@
    bridge-session records the desktop app writes).
 
    Usage:
-     node usage-cost.mjs --session <id> --window <name>,<sinceISO>,<resetISO>[,<untilISO>] [--window ...]
+     node usage-cost.mjs --session <id> --window <name>,<sinceISO>,<resetISO>[,<untilISO>[,<sessionId>]] [--window ...]
          Totals per window: used dollars up to <untilISO> (else up to now), requests,
          per-model split, reset labels, and slackUsd: the dollars of other sessions'
-         requests in the 30 s up to then. The top-level pricesId names the price table.
+         requests in the 30 s up to then. Other than <sessionId> when given, else other
+         than --session's. The top-level pricesId names the price table.
      node usage-cost.mjs --session <id> --whoami
          The session's subscription and the signed-in profile, without a scan.
      node usage-cost.mjs --session <id> --history <days>
@@ -19,8 +20,11 @@
          (YYYY-MM-DD or "today"), both inclusive.
      node usage-cost.mjs --check
          Sets each session's computed cost beside the cost Claude Code itself recorded.
+     node usage-cost.mjs --check-summary
+         The ratios of --check over sessions of at least $0.50, one row per session and
+         model: their number, median, and 5th and 95th percentiles.
 
-   Every mode but --check also takes --label <key>,<ISO> (any number of times), answered
+   Every mode but --check and --check-summary also takes --label <key>,<ISO> (any number of times), answered
    as local-time labels, and --profile-file <path> in place of the config file. */
 
 import crypto from "node:crypto";
@@ -456,12 +460,12 @@ function windows(profile)
     const started = Date.now();
     const specs = args("window").map(spec =>
     {
-        const [name, since, reset, until] = spec.split(",");
+        const [name, since, reset, until, own] = spec.split(",");
         const sinceMs = Date.parse(since);
-        const untilMs = until === undefined ? Infinity : Date.parse(until);
-        if (!name || !Number.isFinite(sinceMs) || Number.isNaN(untilMs))
-            throw new Error("--window takes <name>,<sinceISO>,<resetISO>[,<untilISO>]: " + spec);
-        return { name, sinceMs, resetMs: Date.parse(reset), untilMs };
+        const untilMs = until === undefined || until === "" ? Infinity : Date.parse(until);
+        if (!name || !Number.isFinite(sinceMs) || Number.isNaN(untilMs) || own === "")
+            throw new Error("--window takes <name>,<sinceISO>,<resetISO>[,<untilISO>[,<sessionId>]]: " + spec);
+        return { name, sinceMs, resetMs: Date.parse(reset), untilMs, own };
     });
     if (!specs.length)
         throw new Error("at least one --window is required");
@@ -472,9 +476,10 @@ function windows(profile)
     const out = { org, orgSource, pricesId: PRICES_ID, windows: {}, files: s.fileCount, copiesIgnored: s.copies, ms: 0 };
     for (const w of specs)
     {
-        /* A subagent's requests carry its parent's session, so they count as this session's. */
+        /* A subagent's requests carry its parent's session, so they count as that session's. */
+        const own = w.own || session;
         const slackUntil = Number.isFinite(w.untilMs) ? w.untilMs : started;
-        const slack = tally(s, org, profileOrg, slackUntil - SLACK_MS + 1, slackUntil, undefined, req => !req.sessions.has(session));
+        const slack = tally(s, org, profileOrg, slackUntil - SLACK_MS + 1, slackUntil, undefined, req => !req.sessions.has(own));
         out.windows[w.name] = {
             since: new Date(w.sinceMs).toISOString(),
             ...tally(s, org, profileOrg, w.sinceMs, w.untilMs),
@@ -630,8 +635,9 @@ function report(profile)
     return out;
 }
 
-/* Prices each recorded session and sets it beside the cost Claude Code itself recorded. */
-function check()
+/* Each recorded session's cost per model, as Claude Code recorded it and as priced here. A
+   session can hold more than one cost-state, so a pair can repeat. */
+function checkRows()
 {
     const s = scan(0);
     const bySession = {};
@@ -648,15 +654,61 @@ function check()
             const mine = (bySession[cs.sessionId] || {})[model];
             if (mine === undefined)
                 continue;
-            rows.push({ session: cs.sessionId.slice(0, 8), model, claudeCode: +mu.costUSD.toFixed(4), ours: +mine.toFixed(4), ratio: +(mine / mu.costUSD).toFixed(3) });
+            rows.push({ sessionId: cs.sessionId, model, claudeCode: mu.costUSD, ours: mine });
         }
     return rows;
+}
+
+/* Prices each recorded session and sets it beside the cost Claude Code itself recorded. */
+function check()
+{
+    return checkRows().map(r => ({ session: r.sessionId.slice(0, 8), model: r.model, claudeCode: +r.claudeCode.toFixed(4), ours: +r.ours.toFixed(4), ratio: +(r.ours / r.claudeCode).toFixed(3) }));
+}
+
+const MIN_CHECK_USD = 0.5;
+
+/* The p-quantile of sorted values, interpolated between neighbors. */
+function quantile(sorted, p)
+{
+    const at = (sorted.length - 1) * p;
+    const lo = Math.floor(at);
+    const hi = Math.ceil(at);
+    return sorted[lo] + (sorted[hi] - sorted[lo]) * (at - lo);
+}
+
+/* The latest cost-state of each session and model, the one with the largest recorded cost,
+   and only those of at least MIN_CHECK_USD. */
+function checkSummary()
+{
+    const started = Date.now();
+    const largest = new Map();
+    for (const r of checkRows())
+    {
+        const key = r.sessionId + "|" + r.model;
+        const was = largest.get(key);
+        if (!was || r.claudeCode > was.claudeCode)
+            largest.set(key, r);
+    }
+    const ratios = [...largest.values()]
+        .filter(r => r.claudeCode >= MIN_CHECK_USD)
+        .map(r => r.ours / r.claudeCode)
+        .sort((a, b) => a - b);
+    const round = v => +v.toFixed(3);
+    return {
+        sessions: ratios.length,
+        medianRatio: ratios.length ? round(quantile(ratios, 0.5)) : null,
+        lowRatio: ratios.length ? round(quantile(ratios, 0.05)) : null,
+        highRatio: ratios.length ? round(quantile(ratios, 0.95)) : null,
+        ms: Date.now() - started
+    };
 }
 
 try
 {
     let result;
-    if (process.argv.includes("--check"))
+    if (process.argv.includes("--check-summary"))
+        result = checkSummary();
+    else if (process.argv.includes("--check"))
         result = check();
     else
     {
