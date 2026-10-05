@@ -112,8 +112,14 @@ export type GuideReport = {
   sections: string[]
 }
 
+/** No reading stored yet: what the first run explains, and the command to run again. */
+export type WaitingReport = {
+  type: 'waiting'
+  command: string
+}
+
 declare module 'claude-code' {
   interface PluginState {
-    'usage-dollars': { reports: Record<string, UsageReport | SpendReport | CheckReport | CalibrationReport | GuideReport> }
+    'usage-dollars': { reports: Record<string, UsageReport | SpendReport | CheckReport | CalibrationReport | GuideReport | WaitingReport> }
   }
 }

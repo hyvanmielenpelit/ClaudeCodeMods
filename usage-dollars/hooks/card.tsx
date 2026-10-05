@@ -1,6 +1,6 @@
 /* Drawing: the allowance-first window card, the spending report card, the setup check,
-   calibration and guide cards, their Markdown fallbacks, and the status line. Every date
-   shown arrives already labeled by the helper. */
+   calibration, guide and first-reading cards, their Markdown fallbacks, and the status
+   line. Every date shown arrives already labeled by the helper. */
 
 import type { Elements, RenderSurface } from 'claude-code'
 
@@ -14,6 +14,7 @@ import type {
   RangeReport,
   SpendReport,
   UsageReport,
+  WaitingReport,
   WindowReport,
 } from '../types'
 
@@ -497,6 +498,118 @@ export function calibrationCard(ui: Ui, r: CalibrationReport) {
           ))}
         </Box>
       ))}
+    </Box>
+  )
+}
+
+/* The first run on an installation, before any reply has brought a reading. */
+const WAITING_TITLE = 'Waiting for the first usage reading'
+
+const WAITING_ALL_RIGHT =
+  'Everything is in order. The plugin is installed and running; it has simply not received a usage reading yet. ' +
+  'This is expected right after the plugin is installed or updated, and on its first use on this machine.'
+
+const WAITING_WHY =
+  'Claude Code learns how much of the 5-hour window and the week has been used only from the API, and the API ' +
+  'reports it alongside each model reply: the percent used and when each window resets. Every figure on this card ' +
+  'is built on that reading, and this installation has not stored one yet.'
+
+const waitingSteps = (command: string) => [
+  'Send Claude any message in this session. A short question is enough.',
+  `When the reply has finished, run ${command} again.`,
+  command.endsWith('calibrate')
+    ? 'The card then shows what each window’s estimate rests on.'
+    : 'The card then shows each window: the estimated allowance, what is used and what is left.',
+]
+
+const WAITING_NEXT = [
+  'Every reply refreshes the reading, and the status line keeps showing what is left in each window.',
+  'Readings are stored for this installation, so later sessions show figures at once, before their first reply.',
+  'The first estimates are rough and narrow as readings accumulate over the coming windows; /usage-dollars calibrate shows how far that has come.',
+  'Spending reports read this machine’s transcripts and need no reading: /usage-dollars 24h, 7d or a date range work now.',
+]
+
+const WAITING_FOOTER = 'If no figures appear after a reply, /usage-dollars check shows what is missing.'
+
+export function markdownWaiting(r: WaitingReport, id: string) {
+  return [
+    `### ${WAITING_TITLE}`,
+    '',
+    `✓ ${WAITING_ALL_RIGHT}`,
+    '',
+    '**Why there are no figures yet**',
+    '',
+    WAITING_WHY,
+    '',
+    '**What to do**',
+    '',
+    ...waitingSteps(r.command).map((step, i) => `${i + 1}. ${step}`),
+    '',
+    '**How it works from here**',
+    '',
+    ...WAITING_NEXT.map(line => `- ${line}`),
+    '',
+    `_${WAITING_FOOTER}_`,
+    '',
+    `[//]: # (usage-dollars:report:${id})`,
+  ].join('\n')
+}
+
+export function waitingCard(ui: Ui, r: WaitingReport) {
+  const { Box, Text } = ui
+  const heading = (text: string) => <Text bold>{text}</Text>
+  return (
+    <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={2} paddingY={1} rowGap={1}>
+      <Box flexDirection="row" columnGap={1} flexWrap="wrap">
+        <Text bold>{WAITING_TITLE}</Text>
+        <Text dimColor>· usage-dollars</Text>
+      </Box>
+
+      <Box flexDirection="row" columnGap={1}>
+        <Box width={2}>
+          <Text color="green">✓</Text>
+        </Box>
+        <Box flexGrow={1} flexShrink={1}>
+          <Text>{WAITING_ALL_RIGHT}</Text>
+        </Box>
+      </Box>
+
+      <Box flexDirection="column">
+        {heading('Why there are no figures yet')}
+        <Text>{WAITING_WHY}</Text>
+      </Box>
+
+      <Box flexDirection="column">
+        {heading('What to do')}
+        {waitingSteps(r.command).map((step, i) => (
+          <Box flexDirection="row" columnGap={1}>
+            <Box width={3}>
+              <Text color="blue" bold>
+                {`${i + 1}.`}
+              </Text>
+            </Box>
+            <Box flexGrow={1} flexShrink={1}>
+              <Text>{step}</Text>
+            </Box>
+          </Box>
+        ))}
+      </Box>
+
+      <Box flexDirection="column">
+        {heading('How it works from here')}
+        {WAITING_NEXT.map(line => (
+          <Box flexDirection="row" columnGap={1}>
+            <Box width={2}>
+              <Text dimColor>•</Text>
+            </Box>
+            <Box flexGrow={1} flexShrink={1}>
+              <Text>{line}</Text>
+            </Box>
+          </Box>
+        ))}
+      </Box>
+
+      <Text dimColor>{WAITING_FOOTER}</Text>
     </Box>
   )
 }

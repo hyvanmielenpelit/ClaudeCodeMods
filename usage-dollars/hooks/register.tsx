@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
-import type { CalibrationReport, CheckReport, GuideReport, SpendReport, UsageReport } from '../types'
+import type { CalibrationReport, CheckReport, GuideReport, SpendReport, UsageReport, WaitingReport } from '../types'
 import {
   calibrationCard,
   checkCard,
@@ -11,8 +11,10 @@ import {
   markdownCheck,
   markdownGuide,
   markdownSpend,
+  markdownWaiting,
   markdownWindows,
   spendCard,
+  waitingCard,
   windowCard,
 } from './card'
 import {
@@ -45,8 +47,6 @@ const GUIDE_FILES = new Map([
   ['help advanced', 'GUIDE.md'],
 ])
 
-const NO_FIGURES = 'No usage figures yet: they appear after the first reply in this session.'
-
 const reports = atom({ plugin: 'usage-dollars', key: 'reports' } as const, {})
 
 /* $ never crosses an import, so the measure module reaches the engine through these. */
@@ -76,13 +76,19 @@ function measureThen($: EngineInterface, limits?: readonly SessionRateLimit[], i
   })
 }
 
-async function keep($: EngineInterface, report: UsageReport | SpendReport | CheckReport | CalibrationReport | GuideReport) {
+async function keep($: EngineInterface, report: UsageReport | SpendReport | CheckReport | CalibrationReport | GuideReport | WaitingReport) {
   const id = String(Date.now())
   await update($, reports, all => {
     const kept = Object.entries(all ?? {}).slice(-(KEPT_REPORTS - 1))
     return { ...Object.fromEntries(kept), [id]: report }
   })
   return id
+}
+
+/* The first-reading card, while this installation holds no reading to show. */
+async function waiting($: EngineInterface, command: string) {
+  const report: WaitingReport = { type: 'waiting', command }
+  return { text: markdownWaiting(report, await keep($, report)) }
 }
 
 /* The helper's range arguments for a report form, or undefined when the form is not one. */
@@ -130,7 +136,7 @@ export const register: Register = on => {
 
     if (args === '') {
       const summary = await measureThen($, undefined, true)
-      if (!summary) return { text: NO_FIGURES }
+      if (!summary) return waiting($, '/usage-dollars')
       await markNoticesSeen(hostOf($))
       $.ui.status(statusOf(summary, false))
       const report = toReport(summary, await $.clock.now())
@@ -168,7 +174,7 @@ export const register: Register = on => {
     }
     if (args === 'calibrate') {
       const summary = await measureThen($, undefined, true)
-      if (!summary) return { text: NO_FIGURES }
+      if (!summary) return waiting($, '/usage-dollars calibrate')
       const report = toCalibrationReport(summary)
       return { text: markdownCalibration(report, await keep($, report)) }
     }
@@ -193,6 +199,7 @@ export const register: Register = on => {
     if (r?.type === 'check' && Array.isArray(r.items)) return checkCard(ui, r)
     if (r?.type === 'calibration' && Array.isArray(r.windows)) return calibrationCard(ui, r)
     if (r?.type === 'guide' && Array.isArray(r.sections)) return guideCard(ui, r)
+    if (r?.type === 'waiting') return waitingCard(ui, r)
     return next(e)
   })
 }

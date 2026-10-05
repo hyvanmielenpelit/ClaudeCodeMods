@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { compact, guideOf, guideSections, markdownGuide, statusLine } from '../hooks/card'
+import { compact, guideOf, guideSections, markdownGuide, markdownWaiting, statusLine } from '../hooks/card'
 
 const range = (value: number) => ({ value, low: value * 0.9, high: value * 1.1 })
 
@@ -54,4 +54,12 @@ test('compact figures', () => {
   expect(compact(913)).toBe('$913')
   expect(compact(2812)).toBe('$2.8k')
   expect(compact(28400)).toBe('$28k')
+})
+
+test('the first-reading card says all is well, what to do, and names the command to run again', () => {
+  const text = markdownWaiting({ type: 'waiting', command: '/usage-dollars calibrate' }, '5')
+  expect(text.startsWith('### Waiting for the first usage reading\n\n✓ Everything is in order.')).toBe(true)
+  expect(text).toContain('2. When the reply has finished, run /usage-dollars calibrate again.')
+  expect(text).toContain('3. The card then shows what each window’s estimate rests on.')
+  expect(text.endsWith('[//]: # (usage-dollars:report:5)')).toBe(true)
 })
