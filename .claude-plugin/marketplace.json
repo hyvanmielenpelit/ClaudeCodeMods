@@ -1,0 +1,14 @@
+{
+  "name": "hyvanmielenpelit-claude-code-mods",
+  "description": "Claude Code mods by Hyvän Mielen Pelit",
+  "owner": {
+    "name": "Hyvän Mielen Pelit"
+  },
+  "plugins": [
+    {
+      "name": "usage-dollars",
+      "source": "./usage-dollars",
+      "description": "Subscription usage for the 5-hour window and the week as API-equivalent dollars"
+    }
+  ]
+}
