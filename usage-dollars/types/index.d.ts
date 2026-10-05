@@ -105,9 +105,10 @@ export type CalibrationReport = {
   windows: CalibrationWindow[]
 }
 
-/** The guide, as Markdown sections that each fit one Markdown element. */
+/** A guide: its title, and its Markdown in sections that each fit one Markdown element. */
 export type GuideReport = {
   type: 'guide'
+  title: string
   sections: string[]
 }
 

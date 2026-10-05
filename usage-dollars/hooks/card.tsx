@@ -524,14 +524,23 @@ export function guideSections(text: string) {
   return sections
 }
 
+/** A guide's title, its leading level-1 heading, and the rest in sections. */
+export function guideOf(text: string): GuideReport {
+  const [first = '', ...rest] = guideSections(text)
+  const heading = /^# (.+)(?:\n+|$)/.exec(first)
+  const lead = heading ? first.slice(heading[0].length).trim() : first
+  return { type: 'guide', title: heading?.[1]?.trim() ?? 'usage-dollars', sections: lead ? [lead, ...rest] : rest }
+}
+
 export function markdownGuide(r: GuideReport, id: string) {
-  return [...r.sections, `[//]: # (usage-dollars:report:${id})`].join('\n\n')
+  return [`# ${r.title}`, ...r.sections, `[//]: # (usage-dollars:report:${id})`].join('\n\n')
 }
 
 export function guideCard(ui: Ui, r: GuideReport) {
-  const { Box, Markdown } = ui
+  const { Box, Markdown, Text } = ui
   return (
-    <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={2} paddingY={1} rowGap={1}>
+    <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={3} paddingY={1} rowGap={1}>
+      <Text bold>{r.title}</Text>
       {r.sections.map(text => (
         <Markdown text={text} />
       ))}

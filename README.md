@@ -45,7 +45,8 @@ been opened since.
 | Command | Shows |
 |---|---|
 | `/usage-dollars` | The window card: plan, notices, each window's allowance first, then used, left, the next tick, and spending per model |
-| `/usage-dollars help` | The [guide](usage-dollars/GUIDE.md): every command, setup, reading the card, calibration, the setup check, troubleshooting |
+| `/usage-dollars help` | The [quick start](usage-dollars/QUICKSTART.md): setup, everyday commands, good habits |
+| `/usage-dollars help advanced` | The full [guide](usage-dollars/GUIDE.md): every command, reading the card, calibration, the setup check, troubleshooting |
 | `/usage-dollars report` | Spending in the last 24 hours, per day and per model |
 | `/usage-dollars 24h`, `/usage-dollars 7d` | Spending in the last N hours or days, up to 90 days |
 | `/usage-dollars today` | Spending since local midnight |
@@ -70,9 +71,10 @@ starts earlier, the report says where the transcripts begin.
 
 ### Getting rigorous estimates
 
-The [guide](usage-dollars/GUIDE.md), also shown by `/usage-dollars help`, covers these steps in detail, with what each line of
-`check` and `calibrate` means, how long calibration takes, and what to do when something
-changes.
+The [quick start](usage-dollars/QUICKSTART.md) (`/usage-dollars help`) has the short
+version. The full [guide](usage-dollars/GUIDE.md) (`/usage-dollars help advanced`) covers
+these steps in detail, with what each line of `check` and `calibrate` means, how long
+calibration takes, and what to do when something changes.
 
 1. **Load one copy, then restart every session.** Sessions that started before an update
    keep running the old hooks and can lose readings.
@@ -227,7 +229,8 @@ kept.
 | Path | Role |
 |---|---|
 | `.claude-plugin/plugin.json` | Manifest |
-| `GUIDE.md` | Commands, setup, best practices, calibration and troubleshooting, step by step; shown by `/usage-dollars help` |
+| `QUICKSTART.md` | Setup, everyday commands and good habits in brief; shown by `/usage-dollars help` |
+| `GUIDE.md` | Commands, the card, calibration, the setup check, best practices and troubleshooting; shown by `/usage-dollars help advanced` |
 | `hooks/register.tsx` | Hooks: events, the `/usage-dollars` command forms, toasts |
 | `hooks/measure.ts` | The scan, stored readings and plan history per subscription, the estimates |
 | `hooks/estimate.ts` | Allowance estimate, its 90% range, rounding inference, next tick |

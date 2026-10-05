@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { compact, guideSections, markdownGuide, statusLine } from '../hooks/card'
+import { compact, guideOf, guideSections, markdownGuide, statusLine } from '../hooks/card'
 
 const range = (value: number) => ({ value, low: value * 0.9, high: value * 1.1 })
 
@@ -31,7 +31,14 @@ test('an unseen plan change leads the line', () => {
 test('the guide splits before each level-2 heading, without carriage returns', () => {
   const sections = guideSections('# Guide\r\n\r\nIntro.\r\n\r\n## Commands\r\n\r\n| a | b |\r\n\r\n### Detail\r\n\r\nText.\r\n\r\n## Setup\r\n\r\n1. One\r\n')
   expect(sections).toEqual(['# Guide\n\nIntro.', '## Commands\n\n| a | b |\n\n### Detail\n\nText.', '## Setup\n\n1. One'])
-  expect(markdownGuide({ type: 'guide', sections }, '7').endsWith('[//]: # (usage-dollars:report:7)')).toBe(true)
+  expect(markdownGuide({ type: 'guide', title: 'Guide', sections }, '7').endsWith('[//]: # (usage-dollars:report:7)')).toBe(true)
+})
+
+test('a guide takes its title from the level-1 heading, and keeps the lead under it', () => {
+  const guide = guideOf('# usage-dollars quick start\r\n\r\nSee what is left.\r\n\r\n## Set up once\r\n\r\n1. Load one copy.\r\n')
+  expect(guide).toEqual({ type: 'guide', title: 'usage-dollars quick start', sections: ['See what is left.', '## Set up once\n\n1. Load one copy.'] })
+  expect(markdownGuide(guide, '3').startsWith('# usage-dollars quick start\n\nSee what is left.')).toBe(true)
+  expect(guideOf('## Only\n\nText.').title).toBe('usage-dollars')
 })
 
 test('a guide section longer than one Markdown element is split between paragraphs', () => {

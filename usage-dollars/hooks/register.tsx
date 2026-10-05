@@ -6,7 +6,7 @@ import {
   calibrationCard,
   checkCard,
   guideCard,
-  guideSections,
+  guideOf,
   markdownCalibration,
   markdownCheck,
   markdownGuide,
@@ -36,10 +36,14 @@ const KEPT_REPORTS = 20
 const MARK = /usage-dollars:report:(\d+)/
 
 const USAGE =
-  'Usage: /usage-dollars [help | check | calibrate | report | <N>h | <N>d | today | YYYY-MM-DD | YYYY-MM-DD..YYYY-MM-DD | reset | reset undo]' +
-  ' · /usage-dollars help explains each one.'
+  'Usage: /usage-dollars [help [advanced] | check | calibrate | report | <N>h | <N>d | today | YYYY-MM-DD | YYYY-MM-DD..YYYY-MM-DD | reset | reset undo]' +
+  ' · /usage-dollars help explains them.'
 
-const GUIDE_FILE = 'GUIDE.md'
+/* The files `help` and `help advanced` show, in the plugin folder. */
+const GUIDE_FILES = new Map([
+  ['help', 'QUICKSTART.md'],
+  ['help advanced', 'GUIDE.md'],
+])
 
 const NO_FIGURES = 'No usage figures yet: they appear after the first reply in this session.'
 
@@ -104,7 +108,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'usage-dollars',
       description: 'Subscription usage in API-equivalent dollars: allowance, calibration, spending reports, reset; "help" for the guide',
-      argumentHint: '[help | check | calibrate | report | 24h | 7d | today | YYYY-MM-DD[..YYYY-MM-DD] | reset [undo]]',
+      argumentHint: '[help [advanced] | check | calibrate | report | 24h | 7d | today | YYYY-MM-DD[..YYYY-MM-DD] | reset [undo]]',
     })
     void measureThen($, undefined, true)
     void refreshHistory(hostOf($)).catch(error => $.ui.log(`usage-dollars: history: ${String(error)}`, { to: 'debug' }))
@@ -145,15 +149,16 @@ export const register: Register = on => {
       return { text: isUndone ? 'Reset undone.' : 'Nothing to undo.' }
     }
 
-    if (args === 'help') {
+    const guideFile = GUIDE_FILES.get(args)
+    if (guideFile) {
       let text: string
       try {
-        text = await $.fs.read(`${$.plugin.root}/${GUIDE_FILE}`)
+        text = await $.fs.read(`${$.plugin.root}/${guideFile}`)
       } catch (error) {
         $.ui.log(`usage-dollars: help: ${String(error)}`, { to: 'debug' })
-        return { text: `The guide could not be read: ${GUIDE_FILE} is missing from the plugin folder.\n\n${USAGE}` }
+        return { text: `The guide could not be read: ${guideFile} is missing from the plugin folder.\n\n${USAGE}` }
       }
-      const report: GuideReport = { type: 'guide', sections: guideSections(text) }
+      const report: GuideReport = guideOf(text)
       return { text: markdownGuide(report, await keep($, report)) }
     }
     if (args === 'check') {
