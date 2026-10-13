@@ -19,11 +19,22 @@
 import type { Confidence } from '../types'
 
 /* minSlack and maxSlack: dollars of other sessions' requests close to that side's
-   reading, which its percent may not include yet. */
-export type Bucket = { minUsd: number; minAt: number; maxUsd: number; maxAt: number; minSlack?: number; maxSlack?: number }
+   reading, which its percent may not include yet. minX and maxX: that side's dollars per
+   feature, indexed by the window's features; a missing trailing index means 0. */
+export type Bucket = {
+  minUsd: number
+  minAt: number
+  maxUsd: number
+  maxAt: number
+  minSlack?: number
+  maxSlack?: number
+  minX?: number[]
+  maxX?: number[]
+}
 
-/* pricesId: the price table the dollars were computed with. */
-export type WindowReadings = { kind: string; resetsAt: string; byPct: Record<string, Bucket>; pricesId?: string }
+/* pricesId: the price table the dollars were computed with. features: the feature keys
+   of the buckets' minX and maxX, append-only. */
+export type WindowReadings = { kind: string; resetsAt: string; byPct: Record<string, Bucket>; pricesId?: string; features?: string[] }
 
 export type RangeEstimate = { value: number; low: number; high: number }
 
@@ -45,8 +56,14 @@ export type Evidence = { logA: number; variance: number; shift: number; share: n
     two windows on. */
 export type Spread = { omega: number; weight: number; windows: number; isAssumed: boolean }
 
+/** An allowance in logs: mean, variance, a non-random error of up to `shift` either way,
+    and the degrees of freedom of the interval. */
+export type LogEstimate = { mean: number; variance: number; shift: number; df: number }
+
 export type Estimate = {
   allowance: RangeEstimate
+  /** The log allowance behind `allowance`, before any extra variance. */
+  log: LogEstimate
   left: RangeEstimate
   readings: number
   pastWindows: number
@@ -70,6 +87,8 @@ export type EstimateOptions = {
   now: number
   livePercent?: number
   spread?: Spread
+  /** Added to the log variance before the interval; 0 by default. */
+  extraVariance?: number
 }
 
 const NU0 = 4
@@ -92,12 +111,28 @@ export function resolutionOf(all: readonly WindowReadings[]) {
   return isFine ? 0.1 : 1
 }
 
+const X_UNIT = 1e6
+
+/* The window's features with x's new keys appended in sorted order. */
+function featuresWith(features: readonly string[] | undefined, x: Record<string, number>) {
+  const known = features ?? []
+  const added = Object.keys(x)
+    .filter(f => !known.includes(f))
+    .sort()
+  return [...known, ...added]
+}
+
 /* Within a window dollars only grow, so a tie keeps the later time: the most recent
-   reading that still supports the bound. Each side keeps its reading's slack. */
-export function record(w: WindowReadings, pct: number, usd: number, at: number, slack = 0): WindowReadings {
+   reading that still supports the bound. Each side keeps its reading's slack, and its
+   per-feature dollars x, rounded to 1e-6, when the reading has them. */
+export function record(w: WindowReadings, pct: number, usd: number, at: number, slack = 0, x?: Record<string, number>): WindowReadings {
   const key = String(pct)
   const was = w.byPct[key]
+  const features = x ? featuresWith(w.features, x) : undefined
+  const xs = x && features ? features.map(f => Math.round((x[f] ?? 0) * X_UNIT) / X_UNIT) : undefined
   let bucket: Bucket = { minUsd: usd, minAt: at, maxUsd: usd, maxAt: at, minSlack: slack, maxSlack: slack }
+  let minX = xs
+  let maxX = xs
   if (was) {
     const isMin = usd < was.minUsd || (usd === was.minUsd && at >= was.minAt)
     const isMax = usd > was.maxUsd || (usd === was.maxUsd && at >= was.maxAt)
@@ -109,8 +144,13 @@ export function record(w: WindowReadings, pct: number, usd: number, at: number, 
       minSlack: isMin ? slack : (was.minSlack ?? 0),
       maxSlack: isMax ? slack : (was.maxSlack ?? 0),
     }
+    minX = isMin ? xs : was.minX
+    maxX = isMax ? xs : was.maxX
   }
-  return { ...w, byPct: { ...w.byPct, [key]: bucket } }
+  if (minX) bucket.minX = minX
+  if (maxX) bucket.maxX = maxX
+  const byPct = { ...w.byPct, [key]: bucket }
+  return features ? { ...w, features, byPct } : { ...w, byPct }
 }
 
 /* The window as seen from a regime that started at startedAt: readings taken before it
@@ -121,7 +161,15 @@ export function regimeView(w: WindowReadings, startedAt: number): WindowReadings
     if (b.maxAt < startedAt) continue
     byPct[key] =
       b.minAt < startedAt
-        ? { minUsd: b.maxUsd, minAt: b.maxAt, maxUsd: b.maxUsd, maxAt: b.maxAt, minSlack: b.maxSlack, maxSlack: b.maxSlack }
+        ? {
+            minUsd: b.maxUsd,
+            minAt: b.maxAt,
+            maxUsd: b.maxUsd,
+            maxAt: b.maxAt,
+            minSlack: b.maxSlack,
+            maxSlack: b.maxSlack,
+            ...(b.maxX ? { minX: b.maxX, maxX: b.maxX } : {}),
+          }
         : b
   }
   return { ...w, byPct }
@@ -136,7 +184,7 @@ function shareOf(pct: number, resolution: number, rounding: Rounding) {
 /* Where the share crosses into level p: one point, or for the union one of the two rules'
    points, taken at their geometric center with `shift`, half the log distance between
    them, as an error that is either rule's and not random. */
-function crossingShareOf(pct: number, resolution: number, rounding: Rounding) {
+export function crossingShareOf(pct: number, resolution: number, rounding: Rounding) {
   if (rounding === 'round') return { s: pct - resolution / 2, variance: 0, shift: 0 }
   if (rounding === 'truncate') return { s: pct, variance: 0, shift: 0 }
   const lower = pct - resolution / 2
@@ -163,14 +211,14 @@ export function bounds(w: WindowReadings, resolution: number, rounding: Rounding
   return { low, high }
 }
 
-type Level = { pct: number; bucket: Bucket }
+export type Level = { pct: number; bucket: Bucket }
 
-const levelsOf = (w: WindowReadings): Level[] => Object.entries(w.byPct).map(([key, bucket]) => ({ pct: Number(key), bucket }))
+export const levelsOf = (w: WindowReadings): Level[] => Object.entries(w.byPct).map(([key, bucket]) => ({ pct: Number(key), bucket }))
 
 /* The dollars at which the share crossed into `level`, when the level one step below was
    read before it: the midpoint of the gap less half the slack, uniform over the gap plus
    the slack. Keys of fine levels are not exact, hence the tolerance. */
-function crossingOf(levels: readonly Level[], level: Level, resolution: number) {
+export function crossingOf(levels: readonly Level[], level: Level, resolution: number) {
   const lower = levels.find(l => Math.abs(l.pct - (level.pct - resolution)) < resolution / 1000)
   if (!lower) return undefined
   const gap = level.bucket.minUsd - lower.bucket.maxUsd
@@ -434,6 +482,18 @@ function nextTickOf(a: RangeEstimate, usedUsd: number, resolution: number, cross
   return { value: at(a.value), low: at(a.low), high: at(a.high) }
 }
 
+/** The 90% range of exp(mean), with extraVariance added to the log variance, and no
+    value below floor. The union of the intervals either rounding rule gives. */
+export function rangeOf(log: LogEstimate, extraVariance: number, floor: number): RangeEstimate {
+  const { mean: m, shift, df } = log
+  const h = tQuantile(0.95, df) * Math.sqrt(log.variance + extraVariance) + shift
+  return {
+    value: Math.max(floor, Math.exp(m)),
+    low: Math.max(floor, Math.exp(m - h)),
+    high: Math.max(floor, Math.exp(m + h)),
+  }
+}
+
 export function estimate(w: WindowReadings, usedUsd: number, options: EstimateOptions): Estimate | undefined {
   const { resolution, rounding, past, kind, now, livePercent } = options
   const spread = options.spread ?? ASSUMED_SPREAD
@@ -459,14 +519,9 @@ export function estimate(w: WindowReadings, usedUsd: number, options: EstimateOp
       df = p.df
     }
   }
-  /* The union of the intervals either rounding rule gives. */
-  const h = tQuantile(0.95, df) * Math.sqrt(v) + shift
+  const log = { mean: m, variance: v, shift, df }
   const floor = isAtLimit ? 0 : usedUsd
-  const allowance = {
-    value: Math.max(floor, Math.exp(m)),
-    low: Math.max(floor, Math.exp(m - h)),
-    high: Math.max(floor, Math.exp(m + h)),
-  }
+  const allowance = rangeOf(log, options.extraVariance ?? 0, floor)
   const left = isAtLimit
     ? { value: 0, low: 0, high: 0 }
     : { value: allowance.value - usedUsd, low: allowance.low - usedUsd, high: allowance.high - usedUsd }
@@ -474,6 +529,7 @@ export function estimate(w: WindowReadings, usedUsd: number, options: EstimateOp
   const isSameLevel = ev !== undefined && livePercent !== undefined && Math.abs(ev.pct - livePercent) < resolution / 1000
   return {
     allowance,
+    log,
     left,
     readings: Object.keys(w.byPct).length,
     pastWindows: p.points,

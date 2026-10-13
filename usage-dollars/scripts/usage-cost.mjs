@@ -6,9 +6,10 @@
    Usage:
      node usage-cost.mjs --session <id> --window <name>,<sinceISO>,<resetISO>[,<untilISO>[,<sessionId>]] [--window ...]
          Totals per window: used dollars up to <untilISO> (else up to now), requests,
-         per-model split, reset labels, and slackUsd: the dollars of other sessions'
-         requests in the 30 s up to then. Other than <sessionId> when given, else other
-         than --session's. The top-level pricesId names the price table.
+         per-model and per-feature (byFeature) splits, reset labels, and slackUsd: the
+         dollars of other sessions' requests in the 30 s up to then. Other than
+         <sessionId> when given, else other than --session's. The top-level pricesId
+         names the price table.
      node usage-cost.mjs --session <id> --whoami
          The session's subscription and the signed-in profile, without a scan.
      node usage-cost.mjs --session <id> --history <days>
@@ -91,10 +92,16 @@ const MONTHS = {
     jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11
 };
 
-function priceOf(model)
+/* The PRICES key a model id matches, or null. */
+function priceKeyOf(model)
 {
     const id = String(model || "").replace(/^anthropic\./, "");
-    const key = PREFIXES.find(p => id === p || id.startsWith(p + "-") || id.startsWith(p + "["));
+    return PREFIXES.find(p => id === p || id.startsWith(p + "-") || id.startsWith(p + "[")) || null;
+}
+
+function priceOf(model)
+{
+    const key = priceKeyOf(model);
     return key ? PRICES[key] : null;
 }
 
@@ -117,6 +124,32 @@ function costOf(model, u)
         usd *= FAST_MULTIPLIER;
     usd += ((u.server_tool_use && u.server_tool_use.web_search_requests) || 0) * WEB_SEARCH_USD;
     return usd;
+}
+
+/* costOf split by token class, with the matched PRICES key. Fast mode multiplies the token
+   classes, never the web searches. Null for an unpriced model. */
+function costParts(model, u)
+{
+    const key = priceKeyOf(model);
+    if (!key)
+        return null;
+    const [inp, out, read] = PRICES[key];
+    const c = u.cache_creation || {};
+    const has = c.ephemeral_5m_input_tokens !== undefined || c.ephemeral_1h_input_tokens !== undefined;
+    const w5 = has ? (c.ephemeral_5m_input_tokens || 0) : (u.cache_creation_input_tokens || 0);
+    const w1 = has ? (c.ephemeral_1h_input_tokens || 0) : 0;
+    const speed = u.speed === "fast" ? FAST_MULTIPLIER : 1;
+    return {
+        key,
+        parts: {
+            in: (u.input_tokens || 0) * inp / 1e6 * speed,
+            out: (u.output_tokens || 0) * out / 1e6 * speed,
+            read: (u.cache_read_input_tokens || 0) * read / 1e6 * speed,
+            w5m: w5 * inp * CACHE_5M_MULTIPLIER / 1e6 * speed,
+            w1h: w1 * inp * CACHE_1H_MULTIPLIER / 1e6 * speed
+        },
+        web: ((u.server_tool_use && u.server_tool_use.web_search_requests) || 0) * WEB_SEARCH_USD
+    };
 }
 
 /* Every transcript modified since sinceMs, with its modification time, and the creation
@@ -366,13 +399,15 @@ function ownerOf(req, s, org, profileOrg)
 
 /* Requests with sinceMs <= ts <= untilMs, and only those `isIncluded` accepts when given.
    dayOf, when given, maps a request's time to a per-day bucket that is credited alongside
-   the total. */
+   the total. byFeature splits usd by `<priceKey>[+fast]/<class>`, class one of in, out,
+   read, w5m and w1h, and `web` for web searches; it holds only keys with dollars above 0. */
 function tally(s, org, profileOrg, sinceMs, untilMs, dayOf, isIncluded)
 {
     const out = {
         usd: 0,
         requests: 0,
         byModel: {},
+        byFeature: {},
         otherSubscriptionsUsd: 0,
         unattributedUsd: 0,
         unpricedRequests: 0,
@@ -406,6 +441,13 @@ function tally(s, org, profileOrg, sinceMs, untilMs, dayOf, isIncluded)
         const m = (out.byModel[req.model] = out.byModel[req.model] || { usd: 0, requests: 0 });
         m.usd += usd;
         m.requests++;
+        const split = costParts(req.model, req.usage);
+        const prefix = split.key + (req.usage.speed === "fast" ? "+fast" : "") + "/";
+        for (const [cls, v] of Object.entries(split.parts))
+            if (v > 0)
+                out.byFeature[prefix + cls] = (out.byFeature[prefix + cls] || 0) + v;
+        if (split.web > 0)
+            out.byFeature.web = (out.byFeature.web || 0) + split.web;
         const day = dayOf && dayOf(req.ts);
         if (day)
         {

@@ -31,6 +31,7 @@ any message, or press its button to send a short check message (it uses one turn
 | See your spending | `/usage-dollars 24h`, `7d`, `today`, or a date like `2026-10-01` |
 | See what has been measured | `/usage-dollars calibrate` |
 | Check the setup | `/usage-dollars check` |
+| See how each model counts against the limit | `/usage-dollars models` |
 
 > **Note:** Ranges start wide and narrow on their own as windows fill and reset: within a
 > day or two for the 5-hour window, over about four weeks for the week. You do not need to

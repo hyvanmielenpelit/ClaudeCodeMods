@@ -11,6 +11,7 @@ import {
   pastOf,
   pastPoints,
   prior,
+  rangeOf,
   record,
   regimeView,
   roundingEvidence,
@@ -395,4 +396,100 @@ test('regimeView bounds contain the new allowance after a mid-window change', ()
   const b = bounds(regimeView(w, changedAt), 1, 'round')
   expect(b.low).toBeLessThanOrEqual(3000)
   expect(b.high).toBeGreaterThanOrEqual(3000)
+})
+
+test('record without feature dollars adds no feature keys', () => {
+  const w = record(record(empty(), 5, 50, 100), 5, 55, 200)
+  expect('features' in w).toBe(false)
+  expect(Object.keys(w.byPct['5']).sort()).toEqual(['maxAt', 'maxSlack', 'maxUsd', 'minAt', 'minSlack', 'minUsd'])
+})
+
+test('feature dollars ride with their side through record, new features appended in sorted order', () => {
+  let w = empty()
+  w = record(w, 5, 50, 100, 0, { b: 30, a: 20 })
+  expect(w.features).toEqual(['a', 'b'])
+  expect(w.byPct['5'].minX).toEqual([20, 30])
+  expect(w.byPct['5'].maxX).toEqual([20, 30])
+  /* A new max side, with a new feature and values rounded to 1e-6 dollars. */
+  w = record(w, 5, 55, 200, 0, { c: 1.23456789, a: 21, b: 32.7654321 })
+  expect(w.features).toEqual(['a', 'b', 'c'])
+  expect(w.byPct['5'].minX).toEqual([20, 30])
+  expect(w.byPct['5'].maxX).toEqual([21, 32.765432, 1.234568])
+  /* Neither side: both keep their dollars. A feature it lacks counts as 0. */
+  w = record(w, 5, 52, 150, 0, { a: 52 })
+  expect(w.byPct['5'].minX).toEqual([20, 30])
+  expect(w.byPct['5'].maxX).toEqual([21, 32.765432, 1.234568])
+  w = record(w, 6, 60, 300, 0, { a: 60 })
+  expect(w.features).toEqual(['a', 'b', 'c'])
+  expect(w.byPct['6'].minX).toEqual([60, 0, 0])
+  /* A new min side without feature dollars carries none; the max side keeps its own. */
+  w = record(w, 5, 49, 400)
+  expect(w.byPct['5'].minUsd).toBe(49)
+  expect('minX' in w.byPct['5']).toBe(false)
+  expect(w.byPct['5'].maxX).toEqual([21, 32.765432, 1.234568])
+  expect(w.features).toEqual(['a', 'b', 'c'])
+})
+
+test('regimeView keeps both sides of feature dollars, and the max side of a straddling bucket', () => {
+  let w = empty()
+  w = record(w, 7, 70, 200, 0, { a: 70 })
+  w = record(w, 7, 75, 400, 0, { a: 70, b: 5 })
+  const whole = regimeView(w, 100)
+  expect(whole.byPct['7'].minX).toEqual([70])
+  expect(whole.byPct['7'].maxX).toEqual([70, 5])
+  expect(regimeView(w, 300).byPct['7']).toEqual({
+    minUsd: 75,
+    minAt: 400,
+    maxUsd: 75,
+    maxAt: 400,
+    minSlack: 0,
+    maxSlack: 0,
+    minX: [70, 5],
+    maxX: [70, 5],
+  })
+  let plain = empty()
+  plain = record(plain, 7, 70, 200)
+  plain = record(plain, 7, 75, 400)
+  const view = regimeView(plain, 300).byPct['7']
+  expect('minX' in view).toBe(false)
+  expect('maxX' in view).toBe(false)
+})
+
+test('rangeOf on the log of an estimate reproduces its allowance', () => {
+  const options = { resolution: 1, rounding: 'round' as const, kind: 'seven_day', now: NOW }
+  const past = [2950, 3000, 3050, 3020].map(usd => pastAt(usd, DAY_MS))
+  for (const upTo of [150, 600, 2700]) {
+    const w = simulate(3000, upTo, 1.5, rounded)
+    const alone = estimate(w, upTo, { ...options, past: [] })!
+    const helped = estimate(w, upTo, { ...options, past, livePercent: rounded(upTo / 30) })!
+    /* Short of the limit the allowance is floored at the dollars used. */
+    for (const e of [alone, helped]) expect(rangeOf(e.log, 0, upTo)).toEqual(e.allowance)
+    expect(estimate(w, upTo, { ...options, past: [], extraVariance: 0 })).toEqual(alone)
+  }
+  const fromPrior = estimate(record(empty('five_hour'), 0, 0.14, NOW), 0.14, { ...options, kind: 'five_hour', past: recentPast(), livePercent: 0 })!
+  expect(fromPrior.isPriorOnly).toBe(true)
+  expect(rangeOf(fromPrior.log, 0, 0.14)).toEqual(fromPrior.allowance)
+  /* At the limit the floor is 0. */
+  const full = simulate(1000, 1500, 0.5, capped, empty('five_hour'))
+  const e = estimate(full, 1500, { ...options, kind: 'five_hour', past: [], livePercent: 100 })!
+  expect(rangeOf(e.log, 0, 0)).toEqual(e.allowance)
+})
+
+test('extra variance widens the range symmetrically in logs', () => {
+  const w = simulate(3000, 600, 1.5, rounded)
+  const options = { resolution: 1, rounding: 'round' as const, past: [], kind: 'seven_day', now: NOW, livePercent: 20 }
+  const plain = estimate(w, 600, options)!
+  const wide = estimate(w, 600, { ...options, extraVariance: 0.01 })!
+  expect(wide.log).toEqual(plain.log)
+  expect(rangeOf(wide.log, 0.01, 600)).toEqual(wide.allowance)
+  expect(wide.allowance.value).toBe(plain.allowance.value)
+  /* No floor binds. */
+  expect(wide.allowance.low).toBeGreaterThan(600)
+  const above = Math.log(wide.allowance.high) - Math.log(wide.allowance.value)
+  const below = Math.log(wide.allowance.value) - Math.log(wide.allowance.low)
+  expect(Math.abs(above - below)).toBeLessThan(1e-9)
+  expect(wide.allowance.high).toBeGreaterThan(plain.allowance.high)
+  expect(wide.allowance.low).toBeLessThan(plain.allowance.low)
+  const h = tQuantile(0.95, plain.log.df) * Math.sqrt(plain.log.variance + 0.01) + plain.log.shift
+  expect(Math.abs(above - h)).toBeLessThan(1e-9)
 })

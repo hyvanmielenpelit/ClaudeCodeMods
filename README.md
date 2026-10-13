@@ -54,8 +54,9 @@ been opened since.
 | `/usage-dollars 2026-10-01..2026-10-05` | Spending over local days, both inclusive |
 | `/usage-dollars reset` | Restarts the estimates for this subscription (see below) |
 | `/usage-dollars reset undo` | Undoes the latest reset |
-| `/usage-dollars check` | A setup check: the helper, the subscription, other sessions' hooks and price table, this session's readings, the prices; each ✓, ✗ with the fix, or ℹ |
+| `/usage-dollars check` | A setup check: the helper, the subscription, other sessions' hooks and price table, this session's readings, the stored dollars per model, the prices; each ✓, ✗ with the fix, or ℹ |
 | `/usage-dollars calibrate` | What each window's estimate rests on: percent levels and ticks read, whether each spread and the rounding rule are measured and from how many windows, the current range |
+| `/usage-dollars models` | A read-only study, as seen from this machine, of how each model counts against the limit relative to its API price: the selected meter model with each weight's 90% interval, the cross-validated comparisons behind it, whether the weights hold for the week, and the prospective check |
 
 The window card is allowance-first: a headline row gives each window's estimated allowance,
 its 90% range and a confidence label (`good` within about ±10%, `fair` within ±30%,
@@ -164,6 +165,10 @@ promotion change can no longer be undone.
   taken for a percent another session stored without one, with the dollars up to when
   that session received it. No reading is taken while more than 2% of a window's requests
   go to unpriced models, and readings priced with an older price table are dropped.
+  Each reading also stores its dollars per model and token class (input, output, cache
+  reads, each cache write, web searches), its "features", for both window kinds. Readings
+  from before are backfilled from the transcripts where they still exist; a window that
+  cannot be rebuilt is marked and left out of the model study only.
 - **Allowance** rests on the newest percent level. When the level below it was read too,
   the percent ticked over between those two readings, and the dollars at that moment
   divided by the share at the tick give the dollars per percent; otherwise the share
@@ -219,6 +224,12 @@ session's old percent with current dollars. Upgrading from 0.5.0 drops them once
 they paired the percent with the dollars at the time of the scan. Rate-limit history is
 kept.
 
+Upgrading from 0.6.0 or 0.7.0, which share schema 4, keeps the readings and backfills
+their features. A session still on older hooks that starts after the upgrade deletes the
+stored limits and readings, as every schema change always did, so restart every session
+first. Estimates do not change in 0.8.0: `/usage-dollars models` is a read-only study of
+how each model counts against the limit relative to its API price.
+
 ### Limits
 
 - Usage from other machines, or from claude.ai, on the same subscription is not counted,
@@ -248,13 +259,16 @@ kept.
 | `hooks/register.tsx` | Hooks: events, the `/usage-dollars` command forms, toasts |
 | `hooks/measure.ts` | The scan, stored readings and plan history per subscription, the estimates |
 | `hooks/estimate.ts` | Allowance estimate, its 90% range, rounding inference, next tick |
+| `hooks/meter.ts` | Meter weights per model and token class: segments, fits, model selection, the weekly transfer check, the prospective score |
 | `hooks/plan.ts` | Plan ledger, promotions, regimes, reset and undo |
-| `hooks/card.tsx` | The window, report, check, calibration and guide cards, their Markdown fallbacks, the status line |
+| `hooks/card.tsx` | The window, report, check, calibration, models and guide cards, their Markdown fallbacks, the status line |
 | `scripts/usage-cost.mjs` | Transcript scan, pricing, the profile, date labels (Node) |
 | `types/index.d.ts` | Type contract for the mod's session state |
 | `tests/*.test.ts` | Unit tests: `claude plugin test usage-dollars` (see below) |
+| `tests/meter.test.ts` | Unit tests of the meter weights, run with the other unit tests |
 | `tests/helper.test.mjs` | Helper tests: `node --test usage-dollars/tests/helper.test.mjs` |
 | `tests/coverage.test.mjs` | Coverage of the 90% range in simulated windows: `node --test usage-dollars/tests/coverage.test.mjs` |
+| `tests/meter-coverage.test.mjs` | The meter weights' model selection and coverage in simulated weeks of requests: `node --test usage-dollars/tests/meter-coverage.test.mjs` |
 | `tests/fixtures/` | Synthetic profiles and transcripts for the helper tests |
 
 `claude plugin test` and a `claude plugin validate` that knows every hook this mod uses

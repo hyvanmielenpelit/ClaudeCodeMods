@@ -18,6 +18,28 @@ const CONFIG = path.join(FIXTURES, "config");
 const SLACK_CONFIG = path.join(FIXTURES, "config-slack");
 const SLACK_WINDOW = "session,2026-10-04T11:00:00.000Z,2026-10-04T16:00:00.000Z";
 const SLACK_UNTIL = "2026-10-04T12:00:00.000Z";
+/* Requests from 10:00 to 10:30 on 2026-10-04. session-m, of ORG_A: Opus 5.5 and Fable 5.1
+   over every token class (cache writes both with and without the per-lifetime split), a
+   fast Fable request with one web search, and an Opus request with three; session-n, of
+   ORG_B, a fast Haiku request with two web searches. */
+const MIX_CONFIG = path.join(FIXTURES, "config-mix");
+const MIX_WINDOW = "session,2026-10-04T09:00:00.000Z,2026-10-04T14:00:00.000Z";
+/* session-m's dollars per feature; byFeature omits a key whose dollars are 0. */
+const MIX_FEATURES = {
+    "claude-opus-5-5/in": 4,
+    "claude-opus-5-5/out": 3,
+    "claude-opus-5-5/read": 0.2,
+    "claude-opus-5-5/w5m": 3,
+    "claude-opus-5-5/w1h": 2,
+    "claude-fable-5-1/in": 1,
+    "claude-fable-5-1/out": 1,
+    "claude-fable-5-1/read": 0.5,
+    "claude-fable-5-1/w5m": 1,
+    "claude-fable-5-1/w1h": 1,
+    "claude-fable-5-1+fast/in": 2,
+    "claude-fable-5-1+fast/out": 2,
+    "web": 0.04
+};
 
 const ORG_A = "00000000-0000-4000-8000-000000000001";
 const ORG_B = "00000000-0000-4000-8000-000000000002";
@@ -56,6 +78,7 @@ function run(args, profile = "profile-max5x.json", config = CONFIG, helper = HEL
 
 const sum = values => values.reduce((a, b) => a + b, 0);
 const near = (a, b) => Math.abs(a - b) < 1e-9;
+const nearRelative = (a, b) => Math.abs(a - b) <= 1e-9 * Math.max(Math.abs(a), Math.abs(b));
 
 const MODES = [
     ["--session", "session-a", "--whoami"],
@@ -220,6 +243,60 @@ test("a window's 5th field names the session whose requests are not slack", () =
     assert.ok(near(own.windows.session.slackUsd, 2), `slack ${own.windows.session.slackUsd}`);
     const bad = run(["--session", "session-a", "--window", `${SLACK_WINDOW},${SLACK_UNTIL},`], "profile-max5x.json", SLACK_CONFIG);
     assert.equal(bad.status, 2);
+});
+
+test("byFeature splits a window's dollars by price key, speed and token class", () =>
+{
+    const w = run(["--session", "session-m", "--window", MIX_WINDOW], "profile-max5x.json", MIX_CONFIG).json.windows.session;
+    assert.equal(w.requests, 7);
+    assert.ok(near(w.usd, 20.74), `usd ${w.usd}`);
+    assert.deepEqual(Object.keys(w.byFeature).sort(), Object.keys(MIX_FEATURES).sort());
+    for (const [key, usd] of Object.entries(MIX_FEATURES))
+        assert.ok(nearRelative(w.byFeature[key], usd), `${key} ${w.byFeature[key]}`);
+    assert.ok(nearRelative(sum(Object.values(w.byFeature)), w.usd), `sum ${sum(Object.values(w.byFeature))}`);
+});
+
+test("a fast request lands under +fast, and its web search under web at the plain rate", () =>
+{
+    const { byFeature } = run(["--session", "session-m", "--window", MIX_WINDOW], "profile-max5x.json", MIX_CONFIG).json.windows.session;
+    assert.ok(nearRelative(byFeature["claude-fable-5-1+fast/in"], 2));
+    assert.ok(nearRelative(byFeature["claude-fable-5-1+fast/out"], 2));
+    assert.ok(nearRelative(byFeature.web, 0.04), `web ${byFeature.web}`);
+    assert.deepEqual(Object.keys(byFeature).filter(k => k.includes("+fast")).sort(), ["claude-fable-5-1+fast/in", "claude-fable-5-1+fast/out"]);
+});
+
+test("another subscription's request contributes nothing to byFeature", () =>
+{
+    const w = run(["--session", "session-m", "--window", MIX_WINDOW], "profile-max5x.json", MIX_CONFIG).json.windows.session;
+    assert.ok(near(w.otherSubscriptionsUsd, 2.02), `other ${w.otherSubscriptionsUsd}`);
+    assert.ok(!Object.keys(w.byFeature).some(k => k.startsWith("claude-haiku-4-5")));
+    assert.ok(nearRelative(w.byFeature.web, 0.04), `web ${w.byFeature.web}`);
+});
+
+test("every --window tally carries byFeature, and slack only its total", () =>
+{
+    const specs = [
+        MIX_WINDOW,
+        "week,2026-09-28T00:00:00.000Z,2026-10-05T00:00:00.000Z",
+        "@read,2026-10-04T09:00:00.000Z,2026-10-04T14:00:00.000Z,2026-10-04T10:31:00.000Z",
+        "@stored,2026-10-04T09:00:00.000Z,2026-10-04T14:00:00.000Z,2026-10-04T10:31:00.000Z,session-m",
+        "last24h,2026-10-03T10:30:00.000Z,2026-10-04T10:30:00.000Z",
+        "last7d,2026-09-27T10:30:00.000Z,2026-10-04T10:30:00.000Z",
+        "bf0,2026-10-04T09:00:00.000Z,2026-10-04T14:00:00.000Z,2026-10-04T10:22:00.000Z"
+    ];
+    const out = run(["--session", "session-m", ...specs.flatMap(spec => ["--window", spec])], "profile-max5x.json", MIX_CONFIG).json;
+    assert.deepEqual(Object.keys(out.windows).sort(), ["@read", "@stored", "bf0", "last24h", "last7d", "session", "week"]);
+    for (const [name, w] of Object.entries(out.windows))
+    {
+        assert.equal(typeof w.byFeature, "object", name);
+        assert.ok(nearRelative(sum(Object.values(w.byFeature)), w.usd), `${name} sum ${sum(Object.values(w.byFeature))} usd ${w.usd}`);
+        assert.ok(Object.values(w.byFeature).every(v => v > 0), name);
+        assert.deepEqual(Object.keys(w).filter(k => k.startsWith("slack")), ["slackUsd"], name);
+    }
+    /* Up to 10:22: no fast request and no web search yet, so no such key. */
+    const early = Object.keys(MIX_FEATURES).filter(k => k !== "web" && !k.includes("+fast"));
+    assert.deepEqual(Object.keys(out.windows.bf0.byFeature).sort(), early.sort());
+    assert.ok(near(out.windows.bf0.usd, 15.7), `bf0 usd ${out.windows.bf0.usd}`);
 });
 
 test("--check-summary takes the largest cost-state per session and model, of at least $0.50", () =>

@@ -25,6 +25,7 @@ to read the card, calibration, the setup check, and what to do when something go
 | `/usage-dollars help advanced` | This guide |
 | `/usage-dollars check` | The setup check: ✓, ✗ with the fix, or ℹ per item |
 | `/usage-dollars calibrate` | What each window's estimate rests on, and what is still assumed |
+| `/usage-dollars models` | How each model counts against the limit relative to its API price, as seen from this machine; a read-only study that changes no estimate |
 | `/usage-dollars report` | Spending in the last 24 hours, per day and per model |
 | `/usage-dollars <N>h`, `<N>d` | Spending in the last N hours or days, up to 90 days |
 | `/usage-dollars today` | Spending since local midnight |
@@ -174,6 +175,7 @@ needs a fix, **ℹ** information.
 | **Other hooks** | A session with older or newer hooks stored a percent | Older: restart the other sessions. Newer: restart this one. Load one copy only |
 | **Price table** | Readings priced with another table were dropped | Restart sessions running another copy; expected once after a price update |
 | **Readings** | A percent was lost and nothing explains it | A bug: report it with the debug log |
+| **Model breakdown** | Stored windows whose dollars per model and token class could not be rebuilt from the transcripts, or do not add up; as ℹ, how many windows carry them and how many wait for the backfill | Not rebuilt: nothing, those windows are left out of the model study only. Not adding up: a bug, report it with the debug log |
 | **Prices** | Dollars far from Claude Code's own costs, or a model is unpriced | Update `PRICES` in `scripts/usage-cost.mjs` |
 | **Other usage** | Always ℹ: other computers and claude.ai are not counted | Nothing |
 

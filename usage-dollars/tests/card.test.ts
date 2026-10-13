@@ -1,8 +1,64 @@
 import { expect, test } from 'claude-code/testing'
 
-import { compact, guideOf, guideSections, markdownGuide, markdownWaiting, statusLine } from '../hooks/card'
+import { compact, guideOf, guideSections, markdownGuide, markdownModels, markdownWaiting, statusLine } from '../hooks/card'
+import type { ModelsFit, ModelsReport, ModelsTransfer } from '../types'
 
 const range = (value: number) => ({ value, low: value * 0.9, high: value * 1.1 })
+
+const UNCHECKED: ModelsTransfer = { isChecked: false, isRejected: false, days: 0, delta: 0, se: 0, weeks: 0 }
+
+const M0_FIT: ModelsFit = { model: 'M0', reference: 'all', referenceLabel: 'all models', groups: [], omega: 0.35, windows: 14, segments: 120, df: 9 }
+
+const M1_FIT: ModelsFit = {
+  model: 'M1',
+  reference: 'claude-opus-5-5',
+  referenceLabel: 'Opus 5.5',
+  groups: [{ key: 'claude-fable-5-1', label: 'Fable 5.1', weight: { value: 1.8, low: 1.5, high: 2.2 }, information: 37.4 }],
+  omega: 0.31,
+  windows: 14,
+  segments: 120,
+  df: 13,
+}
+
+const M2_FIT: ModelsFit = {
+  model: 'M2',
+  reference: 'claude-opus-5-5/other',
+  referenceLabel: 'Opus 5.5 except cache reads',
+  groups: [
+    { key: 'claude-opus-5-5/read', label: 'Opus 5.5 cache reads', weight: { value: 0.4, low: 0.32, high: 0.5 }, information: 52 },
+    { key: 'claude-fable-5-1/other', label: 'Fable 5.1 except cache reads', weight: { value: 1.1, low: 0.9, high: 1.3 }, information: 21 },
+  ],
+  omega: 0.24,
+  windows: 14,
+  segments: 120,
+  df: 13,
+}
+
+function modelsOf(over: Partial<ModelsReport>): ModelsReport {
+  return {
+    type: 'models',
+    isFitted: true,
+    qualifying: 14,
+    needed: 4,
+    windows: { used: 14, excluded: [] },
+    segments: 120,
+    excludedSegments: 0,
+    fits: [M0_FIT, M1_FIT],
+    comparisons: [],
+    selected: 'M0',
+    rounding: 'round',
+    transfer: UNCHECKED,
+    omegas: [
+      { title: '5-hour windows', M0: { omega: 0.35, windows: 14, isAssumed: false }, selected: { omega: 0.28, windows: 14, isAssumed: false } },
+      { title: 'Weeks', M0: { omega: 0.5, windows: 1, isAssumed: true }, selected: { omega: 0.5, windows: 1, isAssumed: true } },
+    ],
+    prospective: [
+      { title: '5-hour windows', n: 0, sum: 0, se: 0 },
+      { title: 'Weeks', n: 0, sum: 0, se: 0 },
+    ],
+    ...over,
+  }
+}
 
 test('two estimated windows read as what is left of each allowance', () => {
   const line = statusLine(
@@ -79,4 +135,143 @@ test('without a subscription the first-reading card replaces the steps, and the 
   expect(text).not.toContain('**What to do**')
   expect(text).not.toContain('**How it works from here**')
   expect(text).not.toContain('A check message was sent.')
+})
+
+const MODELS_HEAD = "### Models · usage-dollars\n\n_How each model's API dollars count against the limit, as seen from this machine_\n\n"
+
+test('before 4 qualifying 5-hour windows the models card says how many there are, and the week keeps the API ratio', () => {
+  const text = markdownModels(
+    modelsOf({
+      isFitted: false,
+      qualifying: 2,
+      windows: { used: 2, excluded: [{ reason: 'dollars per model not stored yet', count: 3 }] },
+      segments: 9,
+      fits: [],
+      rounding: 'union',
+    }),
+    '11',
+  )
+  expect(
+    text.startsWith(`${MODELS_HEAD}**Not fitted yet: 2 of 4 5-hour windows with readings per model**\n\n- Week: uses the API ratio, as the 5-hour windows do\n`),
+  ).toBe(true)
+  expect(text).toContain('- 5-hour windows: 2 used\n  - 3 left out: dollars per model not stored yet\n- Segments: 9 used\n')
+  expect(text).toContain('- Rounding rule: not known yet; the fit allows both')
+  expect(text).not.toContain('**Fits**')
+  expect(text).not.toContain('**Comparisons**')
+  expect(text).toContain('- 5-hour windows: ω 0.35 (from 14 windows)\n- Weeks: ω 0.50 (assumed)\n')
+  expect(text).toContain('- 5-hour windows: none yet\n- Weeks: none yet\n')
+  expect(text.endsWith('[//]: # (usage-dollars:report:11)')).toBe(true)
+})
+
+test('when neither richer model wins, the models card says the API ratio holds, with each comparison', () => {
+  const text = markdownModels(
+    modelsOf({
+      excludedSegments: 4,
+      fits: [M0_FIT, M1_FIT, M2_FIT],
+      comparisons: [
+        { from: 'M0', to: 'M1', delta: 0.8, se: 1.9, folds: 10, isSelected: false },
+        { from: 'M0', to: 'M2', delta: -0.4, se: 1.1, folds: 10, isSelected: false },
+      ],
+    }),
+    '12',
+  )
+  expect(
+    text.startsWith(
+      `${MODELS_HEAD}**API ratio holds (M1 not supported: Δ 0.8 ± 1.9 nats; M2 not supported: Δ −0.4 ± 1.1 nats)**\n\n` +
+        '- Week: uses the API ratio, as the 5-hour windows do\n',
+    ),
+  ).toBe(true)
+  expect(text).toContain('- Segments: 120 used, 4 left out as outliers\n- Rounding rule: the API rounds\n')
+  expect(text).toContain(
+    '- M0, the API ratio: ω 0.35, 120 segments\n' +
+      '- M1, a weight per model: ω 0.31, 120 segments, against Opus 5.5\n' +
+      '  - Fable 5.1: 1.8x (90%: 1.5x–2.2x), information 37\n',
+  )
+  expect(text).toContain('- M1 over M0: Δ 0.8 ± 1.9 nats in 10 folds, not selected\n- M2 over M0: Δ −0.4 ± 1.1 nats in 10 folds, not selected\n')
+  expect(text).toContain('- 5-hour windows: ω 0.35 (from 14 windows)\n')
+  expect(text).not.toContain('under the selected weights')
+})
+
+test('a selected M1 leads with each model’s weight, and the week uses it unchecked until enough days', () => {
+  const text = markdownModels(
+    modelsOf({
+      comparisons: [
+        { from: 'M0', to: 'M1', delta: 6.2, se: 2.1, folds: 10, isSelected: true },
+        { from: 'M1', to: 'M2', delta: 0.5, se: 1.4, folds: 10, isSelected: false },
+      ],
+      selected: 'M1',
+      transfer: { ...UNCHECKED, days: 3, weeks: 1 },
+      prospective: [
+        { title: '5-hour windows', n: 6, sum: 3.1, se: 1.2 },
+        { title: 'Weeks', n: 0, sum: 0, se: 0 },
+      ],
+    }),
+    '13',
+  )
+  expect(
+    text.startsWith(
+      `${MODELS_HEAD}**M1 selected: a weight per model (Δ 6.2 ± 2.1 nats over M0)**\n\n` +
+        '- Fable 5.1: 1.8x its API price against the limit (90%: 1.5x–2.2x), from 14 5-hour windows\n' +
+        '- Measured against Opus 5.5, held at 1x its API price\n' +
+        '- Week: uses the 5-hour weights; not yet checked on weeks (3 days so far)\n',
+    ),
+  ).toBe(true)
+  expect(text).toContain('- M1 over M0: Δ 6.2 ± 2.1 nats in 10 folds, selected\n- M2 over M1: Δ 0.5 ± 1.4 nats in 10 folds, not selected\n')
+  expect(text).toContain('- 5-hour windows: ω 0.35 (from 14 windows) under the API ratio, 0.28 (from 14 windows) under the selected weights\n')
+  expect(text).toContain('- 5-hour windows: 6 new windows scored, Σ d 3.1 ± 1.2 nats\n- Weeks: none yet\n')
+  expect(text).toContain('- Closed weeks that qualify: 1\n')
+})
+
+test('a week checked on enough days that agrees keeps the 5-hour weights, beside the weekly-only fit', () => {
+  const weeklyFit: ModelsFit = {
+    ...M1_FIT,
+    omega: 0.4,
+    windows: 4,
+    segments: 30,
+    df: 3,
+    groups: [{ key: 'claude-fable-5-1', label: 'Fable 5.1', weight: { value: 1.6, low: 1.1, high: 2.3 }, information: 9 }],
+  }
+  const text = markdownModels(
+    modelsOf({
+      comparisons: [
+        { from: 'M0', to: 'M1', delta: 6.2, se: 2.1, folds: 10, isSelected: true },
+        { from: 'M1', to: 'M2', delta: 0.5, se: 1.4, folds: 10, isSelected: false },
+      ],
+      selected: 'M1',
+      transfer: { isChecked: true, isRejected: false, days: 9, delta: 1.2, se: 3, weeks: 4, weeklyFit },
+    }),
+    '14',
+  )
+  expect(text).toContain('- Week: uses the 5-hour weights; checked on 9 days, consistent (Δ 1.2 ± 3.0)\n')
+  expect(text).toContain(
+    '- Closed weeks that qualify: 4\n' +
+      '- Weekly-only M1, for comparison only, from 4 weeks: ω 0.40, 30 segments, against Opus 5.5\n' +
+      '  - Fable 5.1: 1.6x (90%: 1.1x–2.3x), information 9\n',
+  )
+})
+
+test('a selected M2 shows cache reads apart, and a rejected week falls back to the API ratio', () => {
+  const text = markdownModels(
+    modelsOf({
+      fits: [M0_FIT, M1_FIT, M2_FIT],
+      comparisons: [
+        { from: 'M0', to: 'M1', delta: 1, se: 1.5, folds: 10, isSelected: false },
+        { from: 'M0', to: 'M2', delta: 9.3, se: 3.2, folds: 10, isSelected: true },
+      ],
+      selected: 'M2',
+      transfer: { isChecked: true, isRejected: true, days: 7, delta: -8.4, se: 2.5, weeks: 3 },
+    }),
+    '15',
+  )
+  expect(
+    text.startsWith(
+      `${MODELS_HEAD}**M2 selected: a weight per model for cache reads and for the rest (Δ 9.3 ± 3.2 nats over M0)**\n\n` +
+        '- Opus 5.5 cache reads: 0.40x its API price against the limit (90%: 0.32x–0.50x), from 14 5-hour windows\n' +
+        '- Fable 5.1 except cache reads: 1.1x its API price against the limit (90%: 0.90x–1.3x), from 14 5-hour windows\n' +
+        '- Measured against Opus 5.5 except cache reads, held at 1x its API price\n' +
+        '- Week: falls back to the API ratio; the 5-hour weights fit the weeks worse on 7 days (Δ −8.4 ± 2.5)\n',
+    ),
+  ).toBe(true)
+  expect(text).toContain('- M2 over M0: Δ 9.3 ± 3.2 nats in 10 folds, selected\n')
+  expect(text).not.toContain('Weekly-only')
 })

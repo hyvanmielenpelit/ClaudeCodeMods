@@ -1,6 +1,6 @@
 /* Drawing: the allowance-first window card, the spending report card, the setup check,
-   calibration, guide and first-reading cards, their Markdown fallbacks, and the status
-   line. Every date shown arrives already labeled by the helper. */
+   calibration, model study, guide and first-reading cards, their Markdown fallbacks, and
+   the status line. Every date shown arrives already labeled by the helper. */
 
 import type { Elements, RenderSurface } from 'claude-code'
 
@@ -10,6 +10,12 @@ import type {
   CheckItem,
   CheckReport,
   GuideReport,
+  MeterModel,
+  ModelsComparison,
+  ModelsFit,
+  ModelsGroup,
+  ModelsReport,
+  ModelsSpread,
   PlanReport,
   RangeReport,
   SpendReport,
@@ -54,7 +60,7 @@ const FOOTNOTE =
 
 const FOOTER =
   '/usage-dollars 24h · 7d · YYYY-MM-DD..YYYY-MM-DD for a spending report · /usage-dollars reset after a plan change · ' +
-  '/usage-dollars help · check · calibrate'
+  '/usage-dollars help · check · calibrate · models'
 
 const NO_ESTIMATE = 'first estimate after the next reply'
 
@@ -436,7 +442,7 @@ export function checkCard(ui: Ui, r: CheckReport) {
               {MARK_OF[item.state]}
             </Text>
           </Box>
-          <Box width={12}>
+          <Box width={16}>
             <Text bold>{item.label}</Text>
           </Box>
           <Box flexGrow={1} flexShrink={1}>
@@ -499,6 +505,199 @@ export function calibrationCard(ui: Ui, r: CalibrationReport) {
           ))}
         </Box>
       ))}
+    </Box>
+  )
+}
+
+const MODEL_TITLE: Record<MeterModel, string> = {
+  M0: 'the API ratio',
+  M1: 'a weight per model',
+  M2: 'a weight per model for cache reads and for the rest',
+}
+
+const ROUNDING_TEXT: Record<ModelsReport['rounding'], string> = {
+  round: 'the API rounds',
+  truncate: 'the API truncates',
+  union: 'not known yet; the fit allows both',
+}
+
+const MODELS_SUBTITLE = "How each model's API dollars count against the limit, as seen from this machine"
+
+const MODELS_FOOTNOTE =
+  'Weights compare models with each other: each is measured against the reference group, not against the limit itself. ' +
+  'Usage on other machines and on claude.ai is not in these dollars. The estimates do not use these weights.'
+
+/* 1.8x, 0.44x, 12x: a meter weight. */
+const times = (w: number) => `${w >= 10 ? w.toFixed(0) : w >= 1 ? w.toFixed(1) : w.toFixed(2)}x`
+
+/* Nats to one decimal, with a minus sign, and never "−0.0". */
+const nats = (x: number) => (Math.abs(x) < 0.05 ? '0.0' : x.toFixed(1).replace('-', '−'))
+
+const deltaOf = (c: { delta: number; se: number }) => `Δ ${nats(c.delta)} ± ${nats(c.se)}`
+
+const intervalOf = (g: ModelsGroup) => `90%: ${times(g.weight.low)}–${times(g.weight.high)}`
+
+const spreadText = (s: ModelsSpread) => `${s.omega.toFixed(2)} (${s.isAssumed ? 'assumed' : `from ${plural(s.windows, 'window')}`})`
+
+type ModelsLine = { text: string; isNested?: boolean }
+
+/* What the weeks use: the API ratio under M0, otherwise the 5-hour weights unless the
+   weekly segments rejected them. */
+function transferLine(r: ModelsReport) {
+  const t = r.transfer
+  if (r.selected === 'M0') return 'Week: uses the API ratio, as the 5-hour windows do'
+  if (!t.isChecked) return `Week: uses the 5-hour weights; not yet checked on weeks (${plural(t.days, 'day')} so far)`
+  return t.isRejected
+    ? `Week: falls back to the API ratio; the 5-hour weights fit the weeks worse on ${plural(t.days, 'day')} (${deltaOf(t)})`
+    : `Week: uses the 5-hour weights; checked on ${plural(t.days, 'day')}, consistent (${deltaOf(t)})`
+}
+
+const groupHeadline = (g: ModelsGroup, windows: number) =>
+  `${g.label}: ${times(g.weight.value)} its API price against the limit (${intervalOf(g)}), from ${plural(windows, '5-hour window')}`
+
+const notSelected = (c: ModelsComparison) => (c.folds > 0 ? `${c.to} not supported: ${deltaOf(c)} nats` : `${c.to} not compared`)
+
+/* The selected outcome: its title, then the weights it gives and what the weeks use. */
+function modelsHeadline(r: ModelsReport) {
+  if (!r.isFitted) {
+    const title =
+      r.qualifying < r.needed
+        ? `Not fitted yet: ${r.qualifying} of ${r.needed} 5-hour windows with readings per model`
+        : `Not fitted: ${plural(r.qualifying, '5-hour window')} with readings per model gave no fit`
+    return { title, lines: [transferLine(r)] }
+  }
+  if (r.selected === 'M0') {
+    const against = r.comparisons.map(notSelected).join('; ')
+    return { title: `API ratio holds${against ? ` (${against})` : ''}`, lines: [transferLine(r)] }
+  }
+  const fit = r.fits.find(f => f.model === r.selected)
+  const won = r.comparisons.find(c => c.to === r.selected && c.isSelected)
+  const weights = fit
+    ? [...fit.groups.map(g => groupHeadline(g, fit.windows)), `Measured against ${fit.referenceLabel}, held at 1x its API price`]
+    : []
+  return {
+    title: `${r.selected} selected: ${MODEL_TITLE[r.selected]}${won ? ` (${deltaOf(won)} nats over ${won.from})` : ''}`,
+    lines: [...weights, transferLine(r)],
+  }
+}
+
+function fitLines(f: ModelsFit, title: string): ModelsLine[] {
+  const against = f.model === 'M0' ? '' : f.groups.length > 0 ? `, against ${f.referenceLabel}` : `; every group merged into ${f.referenceLabel}`
+  return [
+    { text: `${title}: ω ${f.omega.toFixed(2)}, ${plural(f.segments, 'segment')}${against}` },
+    ...f.groups.map(g => ({
+      text: `${g.label}: ${times(g.weight.value)} (${intervalOf(g)}), information ${Math.round(g.information)}`,
+      isNested: true,
+    })),
+  ]
+}
+
+/* The details behind the headline: data, fits, comparisons, weeks, spreads, and the
+   prospective check. */
+function modelsSections(r: ModelsReport) {
+  const t = r.transfer
+  const sections: { title: string; lines: ModelsLine[] }[] = [
+    {
+      title: 'Data',
+      lines: [
+        { text: `5-hour windows: ${r.windows.used} used` },
+        ...r.windows.excluded.map(e => ({ text: `${e.count} left out: ${e.reason}`, isNested: true })),
+        { text: `Segments: ${r.segments} used${r.excludedSegments > 0 ? `, ${r.excludedSegments} left out as outliers` : ''}` },
+        { text: `Rounding rule: ${ROUNDING_TEXT[r.rounding]}` },
+      ],
+    },
+  ]
+  if (r.fits.length > 0) sections.push({ title: 'Fits', lines: r.fits.flatMap(f => fitLines(f, `${f.model}, ${MODEL_TITLE[f.model]}`)) })
+  if (r.comparisons.length > 0)
+    sections.push({
+      title: 'Comparisons',
+      lines: r.comparisons.map(c => ({
+        text:
+          c.folds > 0
+            ? `${c.to} over ${c.from}: ${deltaOf(c)} nats in ${plural(c.folds, 'fold')}, ${c.isSelected ? 'selected' : 'not selected'}`
+            : `${c.to} over ${c.from}: not compared, no group left to weigh`,
+      })),
+    })
+  sections.push({
+    title: 'Weeks',
+    lines: [
+      { text: `Closed weeks that qualify: ${t.weeks}` },
+      ...(t.weeklyFit
+        ? fitLines(t.weeklyFit, `Weekly-only ${t.weeklyFit.model}, for comparison only, from ${plural(t.weeklyFit.windows, 'week')}`)
+        : []),
+    ],
+  })
+  if (r.omegas.length > 0)
+    sections.push({
+      title: 'Spread within windows',
+      lines: r.omegas.map(o => ({
+        text:
+          r.selected === 'M0'
+            ? `${o.title}: ω ${spreadText(o.M0)}`
+            : `${o.title}: ω ${spreadText(o.M0)} under the API ratio, ${spreadText(o.selected)} under the selected weights`,
+      })),
+    })
+  sections.push({
+    title: 'Prospective check',
+    lines: [
+      ...r.prospective.map(p => ({
+        text: `${p.title}: ${p.n === 0 ? 'none yet' : `${plural(p.n, 'new window')} scored, Σ d ${nats(p.sum)} ± ${nats(p.se)} nats`}`,
+      })),
+      { text: 'Each window that closes is scored before the next refit, under the stored weights less under the API ratio; a sum above 0 favors the weights' },
+    ],
+  })
+  return sections
+}
+
+export function markdownModels(r: ModelsReport, id: string) {
+  const head = modelsHeadline(r)
+  const lines = ['### Models · usage-dollars', '', `_${MODELS_SUBTITLE}_`, '', `**${head.title}**`, '', ...head.lines.map(line => `- ${line}`), '']
+  for (const s of modelsSections(r))
+    lines.push(`**${s.title}**`, '', ...s.lines.map(line => `${line.isNested ? '  ' : ''}- ${line.text}`), '')
+  lines.push(`_${MODELS_FOOTNOTE}_`, '', `[//]: # (usage-dollars:report:${id})`)
+  return lines.join('\n')
+}
+
+export function modelsCard(ui: Ui, r: ModelsReport) {
+  const { Box, Text } = ui
+  const head = modelsHeadline(r)
+  return (
+    <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={2} paddingY={1} rowGap={1}>
+      <Box flexDirection="column">
+        <Box flexDirection="row" columnGap={1}>
+          <Text bold>Models</Text>
+          <Text dimColor>· usage-dollars</Text>
+        </Box>
+        <Text dimColor>{MODELS_SUBTITLE}</Text>
+      </Box>
+      <Box flexDirection="column">
+        <Text bold>{head.title}</Text>
+        {head.lines.map(line => (
+          <Text>{line}</Text>
+        ))}
+      </Box>
+      {modelsSections(r).map(s => (
+        <Box flexDirection="column">
+          <Text bold>{s.title}</Text>
+          {s.lines.map(line =>
+            line.isNested ? (
+              <Box flexDirection="row" columnGap={1}>
+                <Box width={2}>
+                  <Text dimColor>·</Text>
+                </Box>
+                <Box flexGrow={1} flexShrink={1}>
+                  <Text>{line.text}</Text>
+                </Box>
+              </Box>
+            ) : (
+              <Text>{line.text}</Text>
+            ),
+          )}
+        </Box>
+      ))}
+      <Text dimColor italic>
+        {MODELS_FOOTNOTE}
+      </Text>
     </Box>
   )
 }

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
-import type { CalibrationReport, CheckReport, GuideReport, SpendReport, UsageReport, WaitingReport } from '../types'
+import type { CalibrationReport, CheckReport, GuideReport, ModelsReport, SpendReport, UsageReport, WaitingReport } from '../types'
 import {
   calibrationCard,
   checkCard,
@@ -10,9 +10,11 @@ import {
   markdownCalibration,
   markdownCheck,
   markdownGuide,
+  markdownModels,
   markdownSpend,
   markdownWaiting,
   markdownWindows,
+  modelsCard,
   spendCard,
   waitingCard,
   windowCard,
@@ -20,6 +22,7 @@ import {
 import {
   checkReport,
   markNoticesSeen,
+  modelsReport,
   refresh,
   refreshHistory,
   resetEstimates,
@@ -40,7 +43,7 @@ const KEPT_REPORTS = 20
 const MARK = /usage-dollars:report:(\d+)/
 
 const USAGE =
-  'Usage: /usage-dollars [help [advanced] | check | calibrate | report | <N>h | <N>d | today | YYYY-MM-DD | YYYY-MM-DD..YYYY-MM-DD | reset | reset undo]' +
+  'Usage: /usage-dollars [help [advanced] | check | calibrate | models | report | <N>h | <N>d | today | YYYY-MM-DD | YYYY-MM-DD..YYYY-MM-DD | reset | reset undo]' +
   ' · /usage-dollars help explains them.'
 
 /* The files `help` and `help advanced` show, in the plugin folder. */
@@ -81,7 +84,10 @@ function measureThen($: EngineInterface, limits?: readonly SessionRateLimit[], i
   })
 }
 
-async function keep($: EngineInterface, report: UsageReport | SpendReport | CheckReport | CalibrationReport | GuideReport | WaitingReport) {
+async function keep(
+  $: EngineInterface,
+  report: UsageReport | SpendReport | CheckReport | CalibrationReport | ModelsReport | GuideReport | WaitingReport,
+) {
   const id = String(Date.now())
   await update($, reports, all => {
     const kept = Object.entries(all ?? {}).slice(-(KEPT_REPORTS - 1))
@@ -142,8 +148,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'usage-dollars',
-      description: 'Subscription usage in API-equivalent dollars: allowance, calibration, spending reports, reset; "help" for the guide',
-      argumentHint: '[help [advanced] | check | calibrate | report | 24h | 7d | today | YYYY-MM-DD[..YYYY-MM-DD] | reset [undo]]',
+      description: 'Subscription usage in API-equivalent dollars: allowance, calibration, model weights, spending reports, reset; "help" for the guide',
+      argumentHint: '[help [advanced] | check | calibrate | models | report | 24h | 7d | today | YYYY-MM-DD[..YYYY-MM-DD] | reset [undo]]',
     })
     void measureThen($, undefined, true)
     void refreshHistory(hostOf($)).catch(error => $.ui.log(`usage-dollars: history: ${String(error)}`, { to: 'debug' }))
@@ -212,6 +218,11 @@ export const register: Register = on => {
       const report = toCalibrationReport(summary)
       return { text: markdownCalibration(report, await keep($, report)) }
     }
+    if (args === 'models') {
+      const report = await modelsReport(hostOf($))
+      await toastNotices($)
+      return { text: markdownModels(report, await keep($, report)) }
+    }
 
     const range = reportRange(args, await $.clock.now())
     if (!range) return { text: USAGE }
@@ -232,6 +243,7 @@ export const register: Register = on => {
     if (r?.type === 'report' && Array.isArray(r.byDay)) return spendCard(ui, r, columns)
     if (r?.type === 'check' && Array.isArray(r.items)) return checkCard(ui, r)
     if (r?.type === 'calibration' && Array.isArray(r.windows)) return calibrationCard(ui, r)
+    if (r?.type === 'models' && Array.isArray(r.fits)) return modelsCard(ui, r)
     if (r?.type === 'guide' && Array.isArray(r.sections)) return guideCard(ui, r)
     if (r?.type === 'waiting' && id) return waitingCard(ui, r, () => void sendCheck($, id))
     return next(e)

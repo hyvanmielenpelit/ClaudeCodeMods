@@ -105,6 +105,91 @@ export type CalibrationReport = {
   windows: CalibrationWindow[]
 }
 
+/** A candidate meter model: M0, the API price ratio; M1, a weight per model; M2, per model
+    for cache reads and for the rest. */
+export type MeterModel = 'M0' | 'M1' | 'M2'
+
+/** One free group of a fit: how the meter counts its API dollars against the reference
+    group's. */
+export type ModelsGroup = {
+  /** A price key under M1, `<priceKey>/read` or `<priceKey>/other` under M2. */
+  key: string
+  /** "Fable 5.1", "Fable 5.1 cache reads", "Fable 5.1 except cache reads". */
+  label: string
+  /** exp(θ), and its 90% interval exp(θ ± t(0.95, df) · se). */
+  weight: RangeReport
+  /** The windows' information on θ; the prior's is 4. */
+  information: number
+}
+
+/** One candidate model fitted on the 5-hour windows. */
+export type ModelsFit = {
+  model: MeterModel
+  /** The group at weight 1 that the others are measured against, and its label. */
+  reference: string
+  referenceLabel: string
+  /** Empty under M0, or when every other group merged into the reference. */
+  groups: ModelsGroup[]
+  /** Within-window spread ω of the fit. */
+  omega: number
+  windows: number
+  segments: number
+  /** Degrees of freedom of the intervals: jackknife blocks less 1. */
+  df: number
+}
+
+/** Cross-validated gain of `to` over `from`, in nats, with its SE; isSelected: `to` won. */
+export type ModelsComparison = { from: MeterModel; to: MeterModel; delta: number; se: number; folds: number; isSelected: boolean }
+
+/** Whether the 5-hour weights hold for the weeks. */
+export type ModelsTransfer = {
+  /** At least 5 days of weekly segments: until then the weeks use the weights unchecked. */
+  isChecked: boolean
+  /** The weeks fall back to M0. */
+  isRejected: boolean
+  days: number
+  /** Log-score gain of the weights over M0 on the weekly segments, in nats, with its SE. */
+  delta: number
+  se: number
+  /** Qualifying closed weeks. */
+  weeks: number
+  /** A weekly-only M1 fit from 4 closed weeks on, for comparison only. */
+  weeklyFit?: ModelsFit
+}
+
+/** calibrateOmega on closed windows of one kind: ω and the windows that measured it. */
+export type ModelsSpread = { omega: number; windows: number; isAssumed: boolean }
+
+export type ModelsOmega = { title: string; M0: ModelsSpread; selected: ModelsSpread }
+
+/** New windows scored before each refit: d is the window's log score under the stored
+    weights less under M0; n records, their sum and its SE. */
+export type ModelsProspective = { title: string; n: number; sum: number; se: number }
+
+/** The meter-weight study, as seen from this machine: summaries only. */
+export type ModelsReport = {
+  type: 'models'
+  /** At least `needed` qualifying 5-hour windows; otherwise no fit, and M0 holds. */
+  isFitted: boolean
+  qualifying: number
+  needed: number
+  /** 5-hour windows of the current regime used, and those left out by reason. */
+  windows: { used: number; excluded: { reason: string; count: number }[] }
+  segments: number
+  excludedSegments: number
+  /** M0, M1 and M2, those that could be fitted. */
+  fits: ModelsFit[]
+  /** M1 against M0, then M2 against the model selected so far. */
+  comparisons: ModelsComparison[]
+  selected: MeterModel
+  rounding: 'round' | 'truncate' | 'union'
+  transfer: ModelsTransfer
+  /** Per window kind. */
+  omegas: ModelsOmega[]
+  /** Per window kind. */
+  prospective: ModelsProspective[]
+}
+
 /** A guide: its title, and its Markdown in sections that each fit one Markdown element. */
 export type GuideReport = {
   type: 'guide'
@@ -124,6 +209,8 @@ export type WaitingReport = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'usage-dollars': { reports: Record<string, UsageReport | SpendReport | CheckReport | CalibrationReport | GuideReport | WaitingReport> }
+    'usage-dollars': {
+      reports: Record<string, UsageReport | SpendReport | CheckReport | CalibrationReport | ModelsReport | GuideReport | WaitingReport>
+    }
   }
 }

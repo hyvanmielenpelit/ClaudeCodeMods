@@ -1,6 +1,8 @@
 /* Measurement: runs the transcript scan, keeps readings and plan history in $.store keyed
    by subscription, and turns them into estimates. The engine reaches this module through
-   a Host that register.tsx builds, since $ itself never crosses an import.
+   a Host that register.tsx builds, since $ itself never crosses an import. After a measure,
+   a second helper call rebuilds the per-feature dollars of readings stored without them,
+   and the meter-weight model fit is refreshed; the estimates do not use it.
 
    $.store is one store shared by every running session, so each key is read immediately
    before it is written, with no wait on the helper in between, and the plan, regime,
@@ -8,7 +10,18 @@
 
 import type { SessionRateLimit } from 'claude-code'
 
-import type { CalibrationReport, CheckItem, CheckReport, ModelSpend, PlanReport, SpendReport, UsageReport, WindowReport } from '../types'
+import type {
+  CalibrationReport,
+  CheckItem,
+  CheckReport,
+  ModelSpend,
+  ModelsFit,
+  ModelsReport,
+  PlanReport,
+  SpendReport,
+  UsageReport,
+  WindowReport,
+} from '../types'
 import { money, statusLine } from './card'
 import {
   MIN_ROUNDING_WINDOWS,
@@ -21,8 +34,11 @@ import {
   regimeView,
   resolutionOf,
   roundingEvidence,
+  tQuantile,
 } from './estimate'
 import type { Calibration, Estimate, Rounding, WindowReadings } from './estimate'
+import { UNIT_WEIGHTS, fingerprintOf, isFeatureComplete, prospectiveScore, selectModel, transferCheck, weightedView } from './meter'
+import type { FitResult, ProspectiveRecord, Selection, StoredFit, Transfer } from './meter'
 import { activePromotions, addRegimes, currentRegime, observePlan, observePromotions, planLabel, regimeStart, startOver, undoStartOver } from './plan'
 import type { Kind, Ledger, NoticeDraft, PlanEntry, Profile, Promotions, Regime, Regimes } from './plan'
 
@@ -40,10 +56,28 @@ const KEPT_NOTICES = 20
 /* Above this share of a window's requests going to unpriced models, its dollars no longer
    track the limit. */
 const MAX_UNPRICED_SHARE = 0.02
-const SCHEMA = 4
+const SCHEMA = 5
 /* What the limits and readings this module stores mean; raise it whenever that changes.
    A stored limit without one is stamp 0. */
-const HOOKS_STAMP = 1
+const HOOKS_STAMP = 2
+/* The engine rejects a store over 4 MiB of JSON text in all keys together; the readings
+   stay within 3 MiB and the other keys are small. */
+const MAX_READINGS_CHARS = 3 * 1024 * 1024
+/* The backfill: window specs per helper call, and its timeout. */
+const BACKFILL_MAX_SPECS = 100
+const BACKFILL_TIMEOUT_MS = 120_000
+/* A side's backfilled dollars match its stored ones within max(relative · usd, absolute),
+   the tolerance of a feature-complete window in meter.ts. */
+const FEATURE_TOLERANCE_RELATIVE = 1e-6
+const FEATURE_TOLERANCE_ABSOLUTE = 2e-4
+/* Per-feature dollars are stored in units of 1e-6, as record() stores them. */
+const X_UNIT = 1e6
+/* Qualifying 5-hour windows a model fit needs, as in meter.ts. */
+const FIT_MIN_WINDOWS = 4
+/* ω of a stored fit without a fitted model; unused, since its weights are M0's. */
+const UNFITTED_OMEGA = 0.5
+/* Prospective records kept per subscription. */
+const PROSPECTIVE_KEPT = 100
 const NONE = 'none'
 /* The suffixes of a window's further tallies: up to the moment this session received its
    percent, and up to the moment the stored percent was received. */
@@ -62,6 +96,7 @@ const PLANS_KEY = 'plans'
 const REGIMES_KEY = 'regimes'
 const PROMOTIONS_KEY = 'promotions'
 const NOTICES_KEY = 'notices'
+const METER_KEY = 'meter'
 
 export const INFERRED_TEXT =
   'Usage no longer matches recent windows: limits may have changed, or this subscription was used elsewhere ' +
@@ -73,6 +108,10 @@ const WINDOWS: readonly { kind: Kind; name: string; title: string; short: string
 ]
 
 const SPAN_MS: Record<string, number> = { five_hour: 5 * HOUR_MS, seven_day: 7 * DAY_MS }
+
+const KINDS: readonly Kind[] = ['five_hour', 'seven_day']
+
+const KIND_TITLES: Record<Kind, string> = { five_hour: '5-hour windows', seven_day: 'Weeks' }
 
 /** What this module needs from the engine: the clock, the session, the helper process,
     $.store, the status line and the debug log. */
@@ -100,7 +139,32 @@ type StoredLimit = { percentUsed?: number; resetsAt: string; observedAt: number;
 
 type StoredLimits = Record<string, Record<string, StoredLimit>>
 
-type StoredReadings = Record<string, WindowReadings & { org: string }>
+/* featuresUnverified: the backfill could not rebuild the window's per-feature dollars, and
+   does not try again. */
+type StoredReading = WindowReadings & { org: string; featuresUnverified?: boolean }
+
+type StoredReadings = Record<string, StoredReading>
+
+/* The model fit of one subscription, refitted only when its fingerprint changes.
+   included: the keys of the qualifying closed windows per kind; regimeStarts: per kind;
+   rounding: the rule of the second pass; fits: per kind, the weights in use with their ω
+   and M0's; prospective: new windows scored before each refit, the latest kept. */
+type MeterEntry = {
+  fingerprint: string
+  included: Record<string, string[]>
+  regimeStarts: Record<string, number>
+  pricesId?: string
+  rounding: Rounding
+  selection: Selection
+  transfer: Transfer
+  fits: Record<string, StoredFit>
+  prospective: ProspectiveRecord[]
+}
+
+type StoredMeter = Record<string, MeterEntry>
+
+/* The subscription and price table whose readings a measure wrote. */
+type MeterContext = { subscription: string; pricesId?: string }
 
 type Observation = { kind: string; resetsAt: string; at: string; usd: number }
 
@@ -120,6 +184,8 @@ type WindowTally = {
   usd: number
   requests: number
   byModel: Record<string, { usd: number; requests: number }>
+  /* usd by feature `<priceKey>[+fast]/<class>` or `web`; keys above 0 only. */
+  byFeature?: Record<string, number>
   otherSubscriptionsUsd: number
   unattributedUsd: number
   unpricedRequests: number
@@ -179,12 +245,17 @@ type Outcome = 'recorded' | 'unpriced' | 'unattributed' | 'missing'
    whose reading of it may have been lost. sessionId: the session that received it. */
 type Candidate = { source: 'mine' | 'stored'; tally: string; percent: number; at: number; sessionId: string }
 
+/* A candidate a measure tried to record, under the window key, and what became of it. */
+type Attempt = { title: string; key: string; c: Candidate; outcome?: Outcome }
+
 export type Diagnostics = {
   /* Another session stored a percent with other hooks since this module first measured:
      older or newer than this one's. */
   otherHooks?: 'older' | 'newer'
   /* Stored windows dropped for another price table, over this session's measures. */
   droppedForPrices: number
+  /* Closed windows dropped to keep the readings within MAX_READINGS_CHARS. */
+  droppedForSize: number
   /* Per window title, what became of the percents the latest measure that had any could
      record. */
   outcomes: Record<string, { source: Candidate['source']; outcome: Outcome }[]>
@@ -197,6 +268,8 @@ export type Summary = {
   plan: PlanReport
   notices: string[]
   last24hUsd?: number
+  /* The last 7 days' dollars by feature. */
+  last7dX?: Record<string, number>
   sinceResetLabel?: string
   files: number
   ms: number
@@ -217,7 +290,14 @@ let lastFreshAt: number | undefined
    the latest wins. */
 let pendingFresh: { host: Host; limits?: readonly SessionRateLimit[]; receivedAt?: number } | undefined
 let firstMeasureAt: number | undefined
-const diagnostics: Diagnostics = { droppedForPrices: 0, outcomes: {} }
+const diagnostics: Diagnostics = { droppedForPrices: 0, droppedForSize: 0, outcomes: {} }
+/* The latest measure that wrote readings; the backfill and the model fit follow it. */
+let meterContext: MeterContext | undefined
+/* The backfill and model fit in flight, and the measure queued after it; the latest wins. */
+let followUp: Promise<void> | undefined
+let queuedFollowUp: { host: Host; context: MeterContext } | undefined
+/* Every write of the readings from this module, one at a time. */
+let readingsTurn: Promise<unknown> = Promise.resolve()
 
 const subscriptionOf = (org: string | null | undefined) => org ?? NONE
 
@@ -254,17 +334,46 @@ async function runScript<T extends { error?: string }>(host: Host, extra: readon
    ones, so both are dropped once more. Schema-3 readings paired the percent with the
    dollars at the time of the scan and carry no slack or price table, so they are dropped
    once again. History comes from rate-limit rejections in the transcripts, not from
-   percents, and is kept from schema 2 on. */
+   percents, and is kept from schema 2 on. Schema-4 limits and readings lack only the
+   per-feature dollars, which the backfill rebuilds, so they are kept. */
 async function migrate(host: Host) {
   if (isMigrated) return
   const was = await host.get(SCHEMA_KEY)
   if (was !== SCHEMA) {
-    await host.delete(LIMITS_KEY)
-    await host.delete(READINGS_KEY)
-    if (was !== 2 && was !== 3) await host.delete(HISTORY_KEY)
+    if (was !== 4) {
+      await host.delete(LIMITS_KEY)
+      await host.delete(READINGS_KEY)
+      if (was !== 2 && was !== 3) await host.delete(HISTORY_KEY)
+    }
     await host.set(SCHEMA_KEY, SCHEMA)
   }
   isMigrated = true
+}
+
+/* Runs `work`, which reads the readings and writes them, after every such work of this
+   module started before it. */
+function exclusively<T>(work: () => Promise<T>): Promise<T> {
+  const turn = readingsTurn.then(work)
+  readingsTurn = turn.catch(() => undefined)
+  return turn
+}
+
+/* The readings within MAX_READINGS_CHARS of JSON text: the oldest closed windows give way
+   first, each one counted. */
+function withinSize(readings: StoredReadings, now: number): StoredReadings {
+  let size = JSON.stringify(readings).length
+  if (size <= MAX_READINGS_CHARS) return readings
+  const kept = { ...readings }
+  const oldest = Object.entries(kept)
+    .filter(([, r]) => Date.parse(r.resetsAt) <= now)
+    .sort(([, a], [, b]) => Date.parse(a.resetsAt) - Date.parse(b.resetsAt))
+  for (const [key, r] of oldest) {
+    if (size <= MAX_READINGS_CHARS) break
+    size -= JSON.stringify(key).length + JSON.stringify(r).length + 2
+    delete kept[key]
+    diagnostics.droppedForSize++
+  }
+  return kept
 }
 
 /** The session's subscription key: its own record, else the signed-in one, else "none". */
@@ -474,6 +583,7 @@ async function measure(
         extra.push('--window', `${c.tally},${since},${limit.resetsAt},${new Date(c.at).toISOString()},${c.sessionId}`)
     }
     extra.push('--window', `last24h,${new Date(now - DAY_MS).toISOString()},${new Date(now).toISOString()}`)
+    extra.push('--window', `last7d,${new Date(now - 7 * DAY_MS).toISOString()},${new Date(now).toISOString()}`)
     extra.push(...labelArgs(regimes, plans, subscription, now))
     const result = await runHelper<WindowsOutput>(host, extra, 120_000)
     if (!result.out?.windows) {
@@ -517,32 +627,38 @@ async function measure(
   /* A guessed subscription must not write readings; with none at all every request is
      counted, as on a machine without bridge-session records. A reading takes its percent
      from a candidate, and only for the window the dollars were scanned for; its dollars
-     end where the percent was received. Readings priced with another table are dropped. */
+     and their features end where the percent was received. Readings priced with another
+     table are dropped. */
   const mayRecord = out.org === null || out.org === undefined || out.orgSource === 'session' || out.orgSource === 'profile'
   const pricesId = out.pricesId
-  const storedReadings = ((await host.get(READINGS_KEY)) ?? {}) as StoredReadings
-  const readings = Object.fromEntries(Object.entries(storedReadings).filter(([, r]) => r.pricesId === pricesId)) as StoredReadings
-  diagnostics.droppedForPrices += Object.keys(storedReadings).length - Object.keys(readings).length
-  const attempts: { title: string; key: string; c: Candidate; outcome?: Outcome }[] = []
-  for (const { w, limit, candidates } of active) {
-    const key = windowKey(subscription, w.kind, limit.resetsAt)
-    for (const c of candidates) {
-      if (c.source === 'stored' && hasReadingAt(readings[key], c.at)) continue
-      const tally = out.windows[c.tally]
-      const attempt: (typeof attempts)[number] = { title: w.title, key, c }
-      attempts.push(attempt)
-      if (!mayRecord) attempt.outcome = 'unattributed'
-      else if (tally && isUnpricedTally(tally)) attempt.outcome = 'unpriced'
-      else if (tally) {
-        const was = readings[key] ?? { kind: w.kind, resetsAt: limit.resetsAt, byPct: {}, org: subscription, pricesId }
-        readings[key] = { ...record(was, c.percent, tally.usd, c.at, tally.slackUsd ?? 0), org: subscription, pricesId }
+  const tallies = out.windows
+  const { kept, attempts } = await exclusively(async () => {
+    const storedReadings = ((await host.get(READINGS_KEY)) ?? {}) as StoredReadings
+    const readings = Object.fromEntries(Object.entries(storedReadings).filter(([, r]) => r.pricesId === pricesId)) as StoredReadings
+    diagnostics.droppedForPrices += Object.keys(storedReadings).length - Object.keys(readings).length
+    const attempts: Attempt[] = []
+    for (const { w, limit, candidates } of active) {
+      const key = windowKey(subscription, w.kind, limit.resetsAt)
+      for (const c of candidates) {
+        if (c.source === 'stored' && hasReadingAt(readings[key], c.at)) continue
+        const tally = tallies[c.tally]
+        const attempt: Attempt = { title: w.title, key, c }
+        attempts.push(attempt)
+        if (!mayRecord) attempt.outcome = 'unattributed'
+        else if (tally && isUnpricedTally(tally)) attempt.outcome = 'unpriced'
+        else if (tally) {
+          const was = readings[key] ?? { kind: w.kind, resetsAt: limit.resetsAt, byPct: {}, org: subscription, pricesId }
+          readings[key] = { ...record(was, c.percent, tally.usd, c.at, tally.slackUsd ?? 0, tally.byFeature), org: subscription, pricesId }
+        }
       }
     }
-  }
-  const kept = Object.fromEntries(
-    Object.entries(readings).filter(([, r]) => Date.parse(r.resetsAt) > now - READINGS_KEPT_MS),
-  ) as StoredReadings
-  await host.set(READINGS_KEY, kept)
+    const kept = withinSize(
+      Object.fromEntries(Object.entries(readings).filter(([, r]) => Date.parse(r.resetsAt) > now - READINGS_KEPT_MS)) as StoredReadings,
+      now,
+    )
+    await host.set(READINGS_KEY, kept)
+    return { kept, attempts }
+  })
   const outcomes: Diagnostics['outcomes'] = {}
   for (const a of attempts) {
     const outcome = a.outcome ?? (isHeld(kept[a.key], a.c.percent, a.c.at) ? 'recorded' : 'missing')
@@ -648,17 +764,251 @@ async function measure(
     ...(windows.some(s => s.estimate?.isPriorContradicted) ? [INFERRED_TEXT] : []),
   ]
 
-  return {
+  const summary: Summary = {
     subscription,
     orgSource: out.orgSource,
     windows,
     plan: planReport(event, profile, labels, now),
     notices,
     last24hUsd: out.windows.last24h?.usd,
+    last7dX: out.windows.last7d?.byFeature,
     sinceResetLabel: windows.find(s => s.sinceResetLabel)?.sinceResetLabel,
     files: out.files,
     ms: out.ms,
   }
+  if (mayRecord) {
+    meterContext = { subscription, pricesId }
+    follow(host, meterContext)
+  }
+  return summary
+}
+
+/* The backfill and the model fit after a measure, one run at a time; a measure that ends
+   while one runs queues the next. Neither delays nor fails the measure. */
+function follow(host: Host, context: MeterContext) {
+  queuedFollowUp = { host, context }
+  if (followUp) return
+  const takeQueued = () => {
+    const next = queuedFollowUp
+    queuedFollowUp = undefined
+    return next
+  }
+  followUp = (async () => {
+    try {
+      for (let next = takeQueued(); next; next = takeQueued()) {
+        const { host: h, context: c } = next
+        await backfillOnce(h, c).catch(error => h.log(`usage-dollars: backfill: ${String(error)}`))
+        await refreshMeter(h, c).catch(error => h.log(`usage-dollars: model fit: ${String(error)}`))
+      }
+    } finally {
+      followUp = undefined
+    }
+  })().catch(() => undefined)
+}
+
+/** The backfill and model fit that measures started, settled once none is left. */
+export function backfillSettled(): Promise<void> {
+  return followUp ?? Promise.resolve()
+}
+
+const toleranceOf = (usd: number) => Math.max(FEATURE_TOLERANCE_RELATIVE * Math.abs(usd), FEATURE_TOLERANCE_ABSOLUTE)
+
+/* One bucket side without per-feature dollars, and the --window name its dollars come
+   back under. */
+type BackfillSide = { key: string; pct: string; isMin: boolean; at: number; usd: number; name: string }
+
+/* Up to BACKFILL_MAX_SPECS window specs for the sides that lack features, newest windows
+   first, open ones included; sides read at the same moment share a spec. Windows the
+   backfill could not rebuild are left out. */
+function backfillPlanOf(readings: StoredReadings, context: MeterContext) {
+  const sides: BackfillSide[] = []
+  const names = new Map<string, string>()
+  const newestFirst = Object.entries(readings)
+    .filter(([, r]) => r.org === context.subscription && r.pricesId === context.pricesId && !r.featuresUnverified && SPAN_MS[r.kind])
+    .sort(([, a], [, b]) => Date.parse(b.resetsAt) - Date.parse(a.resetsAt))
+  for (const [key, r] of newestFirst) {
+    const since = new Date(Date.parse(r.resetsAt) - (SPAN_MS[r.kind] ?? 0)).toISOString()
+    for (const [pct, b] of Object.entries(r.byPct))
+      for (const isMin of [true, false]) {
+        if ((isMin ? b.minX : b.maxX) !== undefined) continue
+        const at = isMin ? b.minAt : b.maxAt
+        const spec = `${since},${r.resetsAt},${new Date(at).toISOString()}`
+        let name = names.get(spec)
+        if (name === undefined) {
+          if (names.size >= BACKFILL_MAX_SPECS) return { sides, names }
+          name = `bf${names.size}`
+          names.set(spec, name)
+        }
+        sides.push({ key, pct, isMin, at, usd: isMin ? b.minUsd : b.maxUsd, name })
+      }
+  }
+  return { sides, names }
+}
+
+/* The window with one side's per-feature dollars as record() stores them: new keys
+   appended in sorted order, values in units of 1e-6. */
+function withSideFeatures(r: StoredReading, pct: string, isMin: boolean, x: Record<string, number>): StoredReading {
+  const b = r.byPct[pct]
+  if (!b) return r
+  const known = r.features ?? []
+  const features = [
+    ...known,
+    ...Object.keys(x)
+      .filter(f => !known.includes(f))
+      .sort(),
+  ]
+  const values = features.map(f => Math.round((x[f] ?? 0) * X_UNIT) / X_UNIT)
+  return { ...r, features, byPct: { ...r.byPct, [pct]: isMin ? { ...b, minX: values } : { ...b, maxX: values } } }
+}
+
+/* One helper call that rescans the dollars of sides stored without features. A side is
+   filled when its rescanned dollars match the stored ones; otherwise its window is marked
+   and not tried again. A failed call changes nothing; the next measure tries again. */
+async function backfillOnce(host: Host, context: MeterContext) {
+  const plan = backfillPlanOf(((await host.get(READINGS_KEY)) ?? {}) as StoredReadings, context)
+  if (plan.sides.length === 0) return
+  const extra = [...plan.names].flatMap(([spec, name]) => ['--window', `${name},${spec}`])
+  const result = await runHelper<WindowsOutput>(host, extra, BACKFILL_TIMEOUT_MS)
+  const out = result.out
+  if (!out?.windows) {
+    host.log(`usage-dollars: backfill: ${result.error ?? 'no windows in the helper output'}`)
+    return
+  }
+  if (subscriptionOf(out.org) !== context.subscription || out.pricesId !== context.pricesId) {
+    host.log('usage-dollars: backfill: the helper scanned another subscription or price table')
+    return
+  }
+  const tallies = out.windows
+  const now = await host.now()
+  await exclusively(async () => {
+    const readings = ((await host.get(READINGS_KEY)) ?? {}) as StoredReadings
+    const next = { ...readings }
+    let isChanged = false
+    for (const s of plan.sides) {
+      const r = next[s.key]
+      const b = r?.byPct[s.pct]
+      const x = tallies[s.name]
+      if (!r || !b || r.featuresUnverified || !x?.byFeature) continue
+      const isUnchanged = (s.isMin ? b.minAt : b.maxAt) === s.at && (s.isMin ? b.minUsd : b.maxUsd) === s.usd
+      if (!isUnchanged || (s.isMin ? b.minX : b.maxX) !== undefined) continue
+      next[s.key] =
+        Math.abs(x.usd - s.usd) <= toleranceOf(s.usd) ? withSideFeatures(r, s.pct, s.isMin, x.byFeature) : { ...r, featuresUnverified: true }
+      isChanged = true
+    }
+    if (isChanged) await host.set(READINGS_KEY, withinSize(next, now))
+  })
+}
+
+/* Closed windows of one kind in the subscription's current regime, as seen from it, that
+   hold readings, with their store keys. */
+function regimeWindowsOf(readings: StoredReadings, context: MeterContext, kind: Kind, startedAt: number, now: number) {
+  return Object.entries(readings)
+    .filter(
+      ([, r]) =>
+        r.org === context.subscription &&
+        r.pricesId === context.pricesId &&
+        r.kind === kind &&
+        Date.parse(r.resetsAt) <= now &&
+        Date.parse(r.resetsAt) >= startedAt,
+    )
+    .map(([key, r]) => ({ key, w: regimeView(r, startedAt) as StoredReading }))
+    .filter(({ w }) => Object.keys(w.byPct).length > 0)
+}
+
+/* What the model fit rests on, read from the store. */
+async function meterInputOf(host: Host, context: MeterContext) {
+  const now = await host.now()
+  const readings = ((await host.get(READINGS_KEY)) ?? {}) as StoredReadings
+  const regimes = ((await host.get(REGIMES_KEY)) ?? {}) as Regimes
+  const all = Object.values(readings).filter(r => r.pricesId === context.pricesId)
+  const resolution = resolutionOf(all)
+  const regimeStarts: Record<string, number> = {}
+  const closed: Record<string, { key: string; w: StoredReading }[]> = {}
+  for (const kind of KINDS) {
+    regimeStarts[kind] = regimeStart(regimes, context.subscription, kind)
+    closed[kind] = regimeWindowsOf(readings, context, kind, regimeStarts[kind] ?? 0, now)
+  }
+  const qualifying = (kind: Kind) => (closed[kind] ?? []).filter(({ w }) => isFeatureComplete(w))
+  return {
+    now,
+    resolution,
+    regimeStarts,
+    closed,
+    fiveHour: qualifying('five_hour'),
+    weekly: qualifying('seven_day'),
+    /* Closed windows of every subscription that may show the rounding rule, as the measure
+       takes them. */
+    forRounding: all.filter(r => Date.parse(r.resetsAt) <= now && !isStraddling(r, regimes)),
+  }
+}
+
+/* Scores the windows that qualify since the stored fit, under its weights for their kind
+   and under M0, before the refit; a kind's records are cleared when its regime or the
+   price table changed. */
+function prospectiveOf(was: MeterEntry | undefined, input: Awaited<ReturnType<typeof meterInputOf>>, pricesId: string | undefined) {
+  let records = [...(was?.prospective ?? [])]
+  if (!was) return records
+  for (const kind of KINDS) {
+    if (was.regimeStarts[kind] !== input.regimeStarts[kind] || was.pricesId !== pricesId) {
+      records = records.filter(p => p.kind !== kind)
+      continue
+    }
+    const fit = was.fits?.[kind]
+    if (!fit) continue
+    const seen = new Set(was.included?.[kind] ?? [])
+    const fresh = (kind === 'five_hour' ? input.fiveHour : input.weekly).filter(({ key }) => !seen.has(key)).map(({ w }) => w)
+    records.push(...prospectiveScore(fit, fresh, { resolution: input.resolution, rounding: was.rounding }))
+  }
+  return records.slice(-PROSPECTIVE_KEPT)
+}
+
+/* The stored model fit of the subscription, refitted when its fingerprint changed: model
+   selection on the 5-hour windows under the union, the rounding rule from the weighted
+   views it gives, selection again under that rule, then the transfer to the weeks. The
+   estimates do not use it. */
+async function refreshMeter(host: Host, context: MeterContext): Promise<MeterEntry | undefined> {
+  const input = await meterInputOf(host, context)
+  const fingerprint = fingerprintOf({
+    fiveHour: input.fiveHour,
+    weekly: input.weekly,
+    regimeStarts: input.regimeStarts,
+    pricesId: context.pricesId,
+    schema: SCHEMA,
+    stamp: HOOKS_STAMP,
+  })
+  const stored = ((await host.get(METER_KEY)) ?? {}) as StoredMeter
+  const was = stored[context.subscription]
+  if (was?.fingerprint === fingerprint) return was
+  const prospective = prospectiveOf(was, input, context.pricesId)
+  const { resolution } = input
+  const fiveHour = input.fiveHour.map(({ w }) => w)
+  const first = selectModel(fiveHour, { resolution, rounding: 'union' })
+  const views = input.forRounding.flatMap(r => weightedView(r, first.weights) ?? [])
+  const rounding = roundingEvidence(views, resolution).rule
+  const selection = rounding === 'union' ? first : selectModel(fiveHour, { resolution, rounding })
+  const transfer = transferCheck(input.weekly.map(({ w }) => w), selection.weights, { resolution, rounding })
+  const entry: MeterEntry = {
+    fingerprint,
+    included: { five_hour: input.fiveHour.map(({ key }) => key), seven_day: input.weekly.map(({ key }) => key) },
+    regimeStarts: input.regimeStarts,
+    ...(context.pricesId !== undefined ? { pricesId: context.pricesId } : {}),
+    rounding,
+    selection,
+    transfer,
+    fits: {
+      five_hour: {
+        weights: selection.weights,
+        omega: selection.fits[selection.selected]?.omega ?? UNFITTED_OMEGA,
+        omegaM0: selection.fits.M0?.omega ?? UNFITTED_OMEGA,
+      },
+      seven_day: transfer.isRejected
+        ? { weights: UNIT_WEIGHTS, omega: transfer.omega.M0, omegaM0: transfer.omega.M0 }
+        : { weights: selection.weights, omega: transfer.omega.selected, omegaM0: transfer.omega.M0 },
+    },
+    prospective,
+  }
+  if (!isSame(entry, was)) await host.set(METER_KEY, { ...stored, [context.subscription]: entry })
+  return entry
 }
 
 /** The status line: what is left of each window's allowance. */
@@ -878,6 +1228,38 @@ function readingsItem(outcomes: Diagnostics['outcomes']): CheckItem {
   return { label, state: 'info', text: 'None received in this session yet: a reading is taken after every reply.' }
 }
 
+/* The subscription's stored windows by the state of their per-feature dollars: complete;
+   marked by the backfill; waiting for it; or carrying features that do not add up. */
+function breakdownOf(readings: StoredReadings, subscription: string) {
+  const counts = { total: 0, complete: 0, unverified: 0, waiting: 0, inconsistent: 0 }
+  for (const r of Object.values(readings)) {
+    if (r.org !== subscription || Object.keys(r.byPct).length === 0) continue
+    counts.total++
+    if (isFeatureComplete(r)) counts.complete++
+    else if (r.featuresUnverified) counts.unverified++
+    else if (Object.values(r.byPct).some(b => !b.minX || !b.maxX)) counts.waiting++
+    else counts.inconsistent++
+  }
+  return counts
+}
+
+function breakdownItem(readings: StoredReadings, subscription: string): CheckItem {
+  const label = 'Model breakdown'
+  const { total, complete, unverified, waiting, inconsistent } = breakdownOf(readings, subscription)
+  if (total === 0) return { label, state: 'info', text: 'No stored windows yet.' }
+  const carry = `${complete} of ${total} stored window${total === 1 ? ' carries' : 's carry'} dollars per model and token class`
+  const wait = waiting > 0 ? ` ${waiting} wait for the backfill, which runs after each measure.` : ''
+  const failures: string[] = []
+  if (unverified > 0)
+    failures.push(
+      `${unverified} could not be rebuilt: the transcripts no longer give their stored dollars, so the model fit leaves them out.`,
+    )
+  if (inconsistent > 0)
+    failures.push(`${inconsistent} carry dollars per model that do not add up to their dollars. Please report it, with the debug log.`)
+  if (failures.length > 0) return { label, state: 'fail', text: `${carry}; ${failures.join(' ')}${wait}` }
+  return { label, state: 'info', text: `${carry}.${wait}` }
+}
+
 function pricesItem(check: CheckSummary, unpriced: readonly string[]): CheckItem {
   const label = 'Prices'
   const update = 'Update PRICES in scripts/usage-cost.mjs; doing so drops the stored readings and calibration starts again.'
@@ -944,6 +1326,7 @@ export async function checkReport(host: Host): Promise<CheckReport> {
       : { label: 'Price table', state: 'ok', text: 'Every stored reading is priced with this table.' },
   )
   items.push(readingsItem(outcomes))
+  if (summary) items.push(breakdownItem(((await host.get(READINGS_KEY)) ?? {}) as StoredReadings, summary.subscription))
 
   const check = await runScript<CheckSummary>(host, ['--check-summary'], 120_000).catch(error => ({ out: undefined, error: String(error) }))
   const unpriced = (summary?.windows ?? []).filter(s => s.isUnpriced).map(s => s.title)
@@ -982,5 +1365,133 @@ export function toCalibrationReport(summary: Summary): CalibrationReport {
         halfWidth: c.halfWidth,
       }
     }),
+  }
+}
+
+/* "Fable 5.1" for claude-fable-5-1; a key of another shape as it is. */
+function priceKeyLabel(priceKey: string) {
+  const parts = /^claude-([a-z]+)-(\d+(?:-\d+)*)$/.exec(priceKey)
+  const name = parts?.[1]
+  const version = parts?.[2]
+  return name && version ? `${name.charAt(0).toUpperCase()}${name.slice(1)} ${version.replace(/-/g, '.')}` : priceKey
+}
+
+function groupLabel(group: string) {
+  if (group === 'all') return 'all models'
+  if (group.endsWith('/read')) return `${priceKeyLabel(group.slice(0, -'/read'.length))} cache reads`
+  if (group.endsWith('/other')) return `${priceKeyLabel(group.slice(0, -'/other'.length))} except cache reads`
+  return priceKeyLabel(group)
+}
+
+function fitReport(f: FitResult): ModelsFit {
+  const t = tQuantile(0.95, Math.max(1, f.df))
+  return {
+    model: f.model,
+    reference: f.groups.reference,
+    referenceLabel: groupLabel(f.groups.reference),
+    groups: f.groups.free.map((key, g) => {
+      const theta = f.theta[g] ?? 0
+      const half = t * (f.se[g] ?? 0)
+      return {
+        key,
+        label: groupLabel(key),
+        weight: { value: Math.exp(theta), low: Math.exp(theta - half), high: Math.exp(theta + half) },
+        information: f.information[g] ?? 0,
+      }
+    }),
+    omega: f.omega,
+    windows: f.windows,
+    segments: f.segments,
+    df: f.df,
+  }
+}
+
+const EMPTY_SELECTION: Selection = {
+  selected: 'M0',
+  weights: UNIT_WEIGHTS,
+  rounding: 'union',
+  fits: {},
+  comparisons: [],
+  windows: { used: 0, excluded: {} },
+  segments: 0,
+  excludedSegments: 0,
+}
+
+const spreadOf = (s: { omega: number; windows: number; isAssumed: boolean }) => ({ omega: s.omega, windows: s.windows, isAssumed: s.isAssumed })
+
+/** The meter-weight study: a forced measure, then the subscription's model fit, refitted
+    when new windows qualify. */
+export async function modelsReport(host: Host): Promise<ModelsReport> {
+  const summary = await remeasure(host)
+  await backfillSettled()
+  const context = meterContext && (!summary || summary.subscription === meterContext.subscription) ? meterContext : undefined
+  const entry = context
+    ? await refreshMeter(host, context).catch(error => {
+        host.log(`usage-dollars: model fit: ${String(error)}`)
+        return undefined
+      })
+    : undefined
+  const input = context ? await meterInputOf(host, context) : undefined
+  const selection = entry?.selection ?? EMPTY_SELECTION
+  const rounding = entry?.rounding ?? 'union'
+
+  /* Closed 5-hour windows of the regime without complete features, live. */
+  const incomplete = (input?.closed.five_hour ?? []).filter(({ w }) => !isFeatureComplete(w))
+  const unverified = incomplete.filter(({ w }) => w.featuresUnverified).length
+  const excluded = [
+    { reason: 'dollars per model not stored yet', count: incomplete.length - unverified },
+    { reason: 'dollars per model could not be rebuilt', count: unverified },
+    { reason: 'fewer than 2 segments', count: selection.windows.excluded['too-few-segments'] ?? 0 },
+  ].filter(e => e.count > 0)
+
+  const omegas = input
+    ? KINDS.map(kind => {
+        const closed = (input.closed[kind] ?? []).map(({ w }) => w)
+        const weights = entry?.fits[kind]?.weights ?? UNIT_WEIGHTS
+        const views = closed.flatMap(w => weightedView(w, weights) ?? [])
+        return {
+          title: KIND_TITLES[kind],
+          M0: spreadOf(calibrateOmega(closed, kind, input.now, input.resolution, rounding)),
+          selected: spreadOf(calibrateOmega(views, kind, input.now, input.resolution, rounding)),
+        }
+      })
+    : []
+
+  const prospective = KINDS.map(kind => {
+    const d = (entry?.prospective ?? []).filter(p => p.kind === kind).map(p => p.d)
+    const n = d.length
+    const sum = d.reduce((a, b) => a + b, 0)
+    const variance = n > 1 ? d.reduce((a, b) => a + (b - sum / n) ** 2, 0) / (n - 1) : 0
+    return { title: KIND_TITLES[kind], n, sum, se: Math.sqrt(n * variance) }
+  })
+
+  const transfer = entry?.transfer
+  const models: readonly FitResult['model'][] = ['M0', 'M1', 'M2']
+  return {
+    type: 'models',
+    isFitted: selection.fits.M0 !== undefined,
+    qualifying: selection.windows.used,
+    needed: FIT_MIN_WINDOWS,
+    windows: { used: selection.windows.used, excluded },
+    segments: selection.segments,
+    excludedSegments: selection.excludedSegments,
+    fits: models.flatMap(m => {
+      const f = selection.fits[m]
+      return f ? [fitReport(f)] : []
+    }),
+    comparisons: selection.comparisons.map(c => ({ ...c })),
+    selected: selection.selected,
+    rounding,
+    transfer: {
+      isChecked: transfer?.isChecked ?? false,
+      isRejected: transfer?.isRejected ?? false,
+      days: transfer?.days ?? 0,
+      delta: transfer?.delta ?? 0,
+      se: transfer?.se ?? 0,
+      weeks: transfer?.weeks ?? 0,
+      ...(transfer?.weeklyFit ? { weeklyFit: fitReport(transfer.weeklyFit) } : {}),
+    },
+    omegas,
+    prospective,
   }
 }
