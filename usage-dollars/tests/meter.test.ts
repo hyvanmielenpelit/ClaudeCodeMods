@@ -4,9 +4,11 @@ import { calibrateOmega, estimate, pastPoints, record } from '../hooks/estimate'
 import type { WindowReadings } from '../hooks/estimate'
 import {
   UNIT_WEIGHTS,
+  familyConversion,
   fit,
   groupsOf,
   isFeatureComplete,
+  modelConversion,
   segmentsOf,
   selectModel,
   transferCheck,
@@ -14,7 +16,10 @@ import {
   weightedView,
   weightsOf,
 } from '../hooks/meter'
-import type { Weights } from '../hooks/meter'
+import type { Weights } from '../hooks/meter'
+/* expect(actual).toBeCloseTo(expected, digits), which claude-code/testing lacks. */
+const expectNear = (actual: number | undefined, expected: number, digits: number) =>
+  expect(Math.abs((actual ?? NaN) - expected)).toBeLessThan(10 ** -digits / 2)
 
 const MINUTE_MS = 60 * 1000
 const HOUR_MS = 60 * MINUTE_MS
@@ -249,4 +254,21 @@ test('the output is deterministic', () => {
   expect(selectModel(F2, OPTIONS)).toEqual(selectModel(F2, OPTIONS))
   const input = inputOf(F2, currentOf(2), F_TWICE)
   expect(weightedEstimate(input)).toEqual(weightedEstimate(input))
+})
+
+test('familyConversion over one key is modelConversion, over two the dollar-weighted mix, and 1 without members', () => {
+  const weights = weightsOf({ model: 'M1', reference: 'claude-opus-5-5', free: ['claude-fable-5-2', 'claude-fable-5-1'] }, [Math.log(0.8), Math.log(1.2)], [[0.01, 0], [0, 0.04]], 9)
+  const x = { 'claude-opus-5-5/out': 10, 'claude-fable-5-2/in': 3, 'claude-fable-5-2+fast/out': 1, 'claude-fable-5-1/read': 4, web: 2 }
+  const isFable52 = (f: string) => f.startsWith('claude-fable-5-2')
+  const one = familyConversion(weights, x, isFable52)
+  const byModel = modelConversion(weights, x)['claude-fable-5-2']!
+  expectNear(one.value, byModel.value, 12)
+  expectNear(one.low, byModel.low, 12)
+  expectNear(one.high, byModel.high, 12)
+  const both = familyConversion(weights, x, f => f.startsWith('claude-fable-'))
+  expectNear(both.value, (0.8 * 4 + 1.2 * 4) / 8, 12)
+  expect(both.low).toBeLessThan(both.value)
+  expect(both.high).toBeGreaterThan(both.value)
+  expect(familyConversion(weights, x, f => f.startsWith('claude-mythos-'))).toEqual({ value: 1, low: 1, high: 1 })
+  expect(familyConversion(weights, x, f => f === 'web')).toEqual({ value: 1, low: 1, high: 1 })
 })

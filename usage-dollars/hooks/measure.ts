@@ -2,7 +2,8 @@
    by subscription, and turns them into estimates. The engine reaches this module through
    a Host that register.tsx builds, since $ itself never crosses an import. After a measure,
    a second helper call rebuilds the per-feature dollars of readings stored without them,
-   and the meter-weight model fit is refreshed; the estimates do not use it.
+   and the meter-weight model fit is refreshed; of the estimates, only Fable's window uses
+   it.
 
    $.store is one store shared by every running session, so each key is read immediately
    before it is written, with no wait on the helper in between, and the plan, regime,
@@ -14,6 +15,7 @@ import type {
   CalibrationReport,
   CheckItem,
   CheckReport,
+  FableReport,
   ModelSpend,
   ModelsFit,
   ModelsReport,
@@ -28,6 +30,7 @@ import {
   calibrateOmega,
   calibrationOf,
   estimate,
+  fallOf,
   pastPoints,
   prior,
   record,
@@ -36,10 +39,34 @@ import {
   roundingEvidence,
   tQuantile,
 } from './estimate'
-import type { Calibration, Estimate, Rounding, WindowReadings } from './estimate'
-import { UNIT_WEIGHTS, fingerprintOf, isFeatureComplete, prospectiveScore, selectModel, transferCheck, weightedView } from './meter'
+import type { Calibration, Estimate, RangeEstimate, Rounding, WindowReadings } from './estimate'
+import { cappedWeeksOf, fableUseE, fableWeightsOf, fableWindow, isAfterFableCap, isFableFeature, isFableInFit } from './fable'
+import type { FableWeights } from './fable'
+import {
+  UNIT_WEIGHTS,
+  familyConversion,
+  fingerprintOf,
+  isFeatureComplete,
+  isUnit,
+  prospectiveScore,
+  selectModel,
+  transferCheck,
+  weightedEstimate,
+  weightedView,
+} from './meter'
 import type { FitResult, ProspectiveRecord, Selection, StoredFit, Transfer } from './meter'
-import { activePromotions, addRegimes, currentRegime, observePlan, observePromotions, planLabel, regimeStart, startOver, undoStartOver } from './plan'
+import {
+  activePromotions,
+  addRegimes,
+  currentRegime,
+  fableShareOf,
+  observePlan,
+  observePromotions,
+  planLabel,
+  regimeStart,
+  startOver,
+  undoStartOver,
+} from './plan'
 import type { Kind, Ledger, NoticeDraft, PlanEntry, Profile, Promotions, Regime, Regimes } from './plan'
 
 const MINUTE_MS = 60 * 1000
@@ -47,7 +74,9 @@ const HOUR_MS = 60 * MINUTE_MS
 const DAY_MS = 24 * HOUR_MS
 const MIN_GAP_MS = MINUTE_MS
 const FRESH_MS = 5 * MINUTE_MS
+/* How long readings are kept after their reset: 5-hour windows, and weeks. */
 const READINGS_KEPT_MS = 28 * DAY_MS
+const WEEKS_KEPT_MS = 12 * 7 * DAY_MS
 const HISTORY_DAYS = 14
 const HISTORY_REFRESH_MS = 6 * HOUR_MS
 const NOTICE_SHOWN_MS = 7 * DAY_MS
@@ -83,6 +112,8 @@ const NONE = 'none'
    percent, and up to the moment the stored percent was received. */
 const AT_READ = '@read'
 const AT_STORED = '@stored'
+/* The suffix of the week's tally since its reported percent fell. */
+const AT_FALL = '@fall'
 /* Median ratio of these dollars to Claude Code's own costs outside which the price table
    is out of date. */
 const MIN_PRICE_RATIO = 0.9
@@ -101,6 +132,14 @@ const METER_KEY = 'meter'
 export const INFERRED_TEXT =
   'Usage no longer matches recent windows: limits may have changed, or this subscription was used elsewhere ' +
   '(inferred from usage, not from the plan). If you changed plans, run /usage-dollars reset.'
+
+export const FABLE_CAP_TEXT =
+  "Fable has likely reached its weekly cap, half of the week's allowance (derived, not reported by Claude Code). " +
+  'Further Fable requests bill usage credits or switch models. While they bill credits, the estimates run high.'
+
+const fellText = (title: string) =>
+  `${title}: the reported percent fell, as after a limit reset. Later readings of this window are not recorded, ` +
+  'and what is left follows the reported percent.'
 
 const WINDOWS: readonly { kind: Kind; name: string; title: string; short: string; spanMs: number }[] = [
   { kind: 'five_hour', name: 'session', title: '5-hour window', short: '5h', spanMs: 5 * HOUR_MS },
@@ -148,7 +187,8 @@ type StoredReadings = Record<string, StoredReading>
 /* The model fit of one subscription, refitted only when its fingerprint changes.
    included: the keys of the qualifying closed windows per kind; regimeStarts: per kind;
    rounding: the rule of the second pass; fits: per kind, the weights in use with their ω
-   and M0's; prospective: new windows scored before each refit, the latest kept. */
+   and M0's; prospective: new windows scored before each refit, the latest kept; capped:
+   the weeks left out for Fable's cap, by store key, with the moment of the cap. */
 type MeterEntry = {
   fingerprint: string
   included: Record<string, string[]>
@@ -159,12 +199,14 @@ type MeterEntry = {
   transfer: Transfer
   fits: Record<string, StoredFit>
   prospective: ProspectiveRecord[]
+  capped?: Record<string, number>
 }
 
 type StoredMeter = Record<string, MeterEntry>
 
-/* The subscription and price table whose readings a measure wrote. */
-type MeterContext = { subscription: string; pricesId?: string }
+/* The subscription and price table whose readings a measure wrote, and Fable's share of
+   the week on its plan. */
+type MeterContext = { subscription: string; pricesId?: string; share?: number }
 
 type Observation = { kind: string; resetsAt: string; at: string; usd: number }
 
@@ -186,6 +228,8 @@ type WindowTally = {
   byModel: Record<string, { usd: number; requests: number }>
   /* usd by feature `<priceKey>[+fast]/<class>` or `web`; keys above 0 only. */
   byFeature?: Record<string, number>
+  /* The Fable models' share of usd and requests; absent counts as none. */
+  fable?: { usd: number; requests: number }
   otherSubscriptionsUsd: number
   unattributedUsd: number
   unpricedRequests: number
@@ -222,10 +266,14 @@ type ReportOutput = HelperBase & {
 }
 
 /* closedWindows: closed windows of this kind and regime that hold readings. halfWidth: of
-   the current 90% range, in proportion. */
-type WindowCalibration = Calibration & { closedWindows: number; rounding: Rounding; halfWidth?: number }
+   the current 90% range, in proportion. fableCapped: closed windows left out for Fable's
+   cap. */
+type WindowCalibration = Calibration & { closedWindows: number; rounding: Rounding; halfWidth?: number; fableCapped?: number }
 
+/* fellAt: the latest reading before the reported percent fell; leftByPercent: then what
+   is left, from the allowance and the latest reported percent. */
 type WindowState = {
+  kind: Kind
   title: string
   short: string
   resetsAt: string
@@ -236,10 +284,12 @@ type WindowState = {
   percent?: number
   percentAt?: number
   calibration: WindowCalibration
+  fellAt?: number
+  leftByPercent?: RangeEstimate
 }
 
 /* Why a percent a measure could have recorded was not: `missing` when nothing explains it. */
-type Outcome = 'recorded' | 'unpriced' | 'unattributed' | 'missing'
+type Outcome = 'recorded' | 'unpriced' | 'unattributed' | 'fell' | 'missing'
 
 /* A percent that may be recorded: this session's fresh one, or one stored by a session
    whose reading of it may have been lost. sessionId: the session that received it. */
@@ -259,6 +309,8 @@ export type Diagnostics = {
   /* Per window title, what became of the percents the latest measure that had any could
      record. */
   outcomes: Record<string, { source: Candidate['source']; outcome: Outcome }[]>
+  /* Kinds of live rate limits this module does not measure. */
+  unknownKinds: string[]
 }
 
 export type Summary = {
@@ -270,6 +322,8 @@ export type Summary = {
   last24hUsd?: number
   /* The last 7 days' dollars by feature. */
   last7dX?: Record<string, number>
+  /* Max and Ultra: Fable's share of the week, derived. */
+  fable?: FableReport
   sinceResetLabel?: string
   files: number
   ms: number
@@ -290,7 +344,7 @@ let lastFreshAt: number | undefined
    the latest wins. */
 let pendingFresh: { host: Host; limits?: readonly SessionRateLimit[]; receivedAt?: number } | undefined
 let firstMeasureAt: number | undefined
-const diagnostics: Diagnostics = { droppedForPrices: 0, droppedForSize: 0, outcomes: {} }
+const diagnostics: Diagnostics = { droppedForPrices: 0, droppedForSize: 0, outcomes: {}, unknownKinds: [] }
 /* The latest measure that wrote readings; the backfill and the model fit follow it. */
 let meterContext: MeterContext | undefined
 /* The backfill and model fit in flight, and the measure queued after it; the latest wins. */
@@ -483,7 +537,37 @@ function isStraddling(r: WindowReadings & { org: string }, regimes: Regimes) {
   )
 }
 
-function basisOf(e: Estimate | undefined, isUnpriced: boolean, sinceResetLabel: string | undefined) {
+/* The newest max side of a window: its dollars, and its per-feature dollars when stored. */
+function latestSideOf(r: WindowReadings) {
+  let newest: WindowReadings['byPct'][string] | undefined
+  for (const b of Object.values(r.byPct)) if (!newest || b.maxAt > newest.maxAt) newest = b
+  const features = r.features ?? []
+  const x = newest?.maxX ? Object.fromEntries(features.map((f, i) => [f, newest!.maxX![i] ?? 0]).filter(([, v]) => (v as number) > 0)) : undefined
+  return { usd: newest?.maxUsd ?? 0, x: x as Record<string, number> | undefined }
+}
+
+/* The subscription's stored weeks, with their store keys. */
+const weeksOf = (readings: StoredReadings, subscription: string) =>
+  Object.entries(readings)
+    .filter(([, r]) => r.org === subscription && r.kind === 'seven_day')
+    .map(([key, r]) => ({ key, r }))
+
+/* The capped weeks as isAfterFableCap takes them. */
+const capMomentsOf = (capped: Record<string, number>, readings: StoredReadings) =>
+  Object.entries(capped).flatMap(([key, capAt]) => {
+    const r = readings[key]
+    return r ? [{ capAt, resetsAt: Date.parse(r.resetsAt) }] : []
+  })
+
+/* Closed windows left out for Fable's cap: capped weeks, and 5-hour windows after a cap. */
+function isLeftOutForFable(kind: string, key: string, r: WindowReadings, capped: Record<string, number>, moments: ReturnType<typeof capMomentsOf>) {
+  return kind === 'seven_day' ? key in capped : isAfterFableCap(r, moments)
+}
+
+const FELL_BASIS = ' · the reported percent fell in this window: left follows the percent'
+
+function basisOf(e: Estimate | undefined, isUnpriced: boolean, sinceResetLabel: string | undefined, isFallen = false): string {
+  if (isFallen && e && !isUnpriced) return `${basisOf(e, isUnpriced, sinceResetLabel)}${FELL_BASIS}`
   const reset = sinceResetLabel ? ` · since reset ${sinceResetLabel}` : ''
   if (isUnpriced) return `Unpriced models in use: no estimate${reset}.`
   if (!e) return `No estimate yet: the limit has not reported a usable reading for this window${reset}.`
@@ -575,12 +659,16 @@ async function measure(
 
     const regimes = ((await host.get(REGIMES_KEY)) ?? {}) as Regimes
     const plans = ((await host.get(PLANS_KEY)) ?? {}) as Ledger
+    const before = ((await host.get(READINGS_KEY)) ?? {}) as StoredReadings
     const extra: string[] = []
     for (const { w, limit, candidates } of active) {
       const since = new Date(Date.parse(limit.resetsAt) - w.spanMs).toISOString()
       extra.push('--window', `${w.name},${since},${limit.resetsAt}`)
       for (const c of candidates)
         extra.push('--window', `${c.tally},${since},${limit.resetsAt},${new Date(c.at).toISOString()},${c.sessionId}`)
+      /* A limit reset gives back the week's Fable use: Fable counts from the fall on. */
+      const fall = w.kind === 'seven_day' ? before[windowKey(subscription, w.kind, limit.resetsAt)]?.fall : undefined
+      if (fall?.isConfirmed) extra.push('--window', `${w.name}${AT_FALL},${new Date(fall.lastAt + 1).toISOString()},${limit.resetsAt}`)
     }
     extra.push('--window', `last24h,${new Date(now - DAY_MS).toISOString()},${new Date(now).toISOString()}`)
     extra.push('--window', `last7d,${new Date(now - 7 * DAY_MS).toISOString()},${new Date(now).toISOString()}`)
@@ -618,6 +706,12 @@ async function measure(
     if (isChanged) await host.set(LIMITS_KEY, { ...stored, [subscription]: mine })
   }
 
+  /* Live limits of a kind this module does not measure. */
+  for (const l of live) {
+    const kind = String(l.kind)
+    if (!WINDOWS.some(w => w.kind === kind) && kind !== 'spend_limit' && !diagnostics.unknownKinds.includes(kind)) diagnostics.unknownKinds.push(kind)
+  }
+
   /* Hooks of another stamp that stored a percent since this module first measured. */
   for (const l of Object.values(storedLimits[subscription] ?? {})) {
     const stamp = l.stamp ?? 0
@@ -639,7 +733,8 @@ async function measure(
     const attempts: Attempt[] = []
     for (const { w, limit, candidates } of active) {
       const key = windowKey(subscription, w.kind, limit.resetsAt)
-      for (const c of candidates) {
+      /* In the order received, so that a fall is judged reading after reading. */
+      for (const c of [...candidates].sort((a, b) => a.at - b.at)) {
         if (c.source === 'stored' && hasReadingAt(readings[key], c.at)) continue
         const tally = tallies[c.tally]
         const attempt: Attempt = { title: w.title, key, c }
@@ -647,13 +742,32 @@ async function measure(
         if (!mayRecord) attempt.outcome = 'unattributed'
         else if (tally && isUnpricedTally(tally)) attempt.outcome = 'unpriced'
         else if (tally) {
-          const was = readings[key] ?? { kind: w.kind, resetsAt: limit.resetsAt, byPct: {}, org: subscription, pricesId }
-          readings[key] = { ...record(was, c.percent, tally.usd, c.at, tally.slackUsd ?? 0, tally.byFeature), org: subscription, pricesId }
+          /* One lower percent is a suspicion, since a slow response can deliver an older
+             percent than one already stored; a second, received later, is a fall. */
+          const stored = readings[key]
+          const fall = stored?.fall
+          const fell = stored && !fall?.isConfirmed ? fallOf(stored, c.percent, c.at) : undefined
+          if (stored && fall?.isConfirmed) attempt.outcome = 'fell'
+          else if (stored && fell) {
+            attempt.outcome = 'fell'
+            readings[key] = {
+              ...stored,
+              fall: fall ? (c.at > fall.seenAt ? { ...fall, isConfirmed: true } : fall) : { lastAt: fell.lastAt, seenAt: c.at, isConfirmed: false },
+            }
+          } else {
+            let was: StoredReading = stored ?? { kind: w.kind, resetsAt: limit.resetsAt, byPct: {}, org: subscription, pricesId }
+            if (fall && c.at > fall.seenAt) {
+              const { fall: _, ...rest } = was
+              was = rest
+            }
+            readings[key] = { ...record(was, c.percent, tally.usd, c.at, tally.slackUsd ?? 0, tally.byFeature), org: subscription, pricesId }
+          }
         }
       }
     }
+    const keptFor = (kind: string) => (kind === 'seven_day' ? WEEKS_KEPT_MS : READINGS_KEPT_MS)
     const kept = withinSize(
-      Object.fromEntries(Object.entries(readings).filter(([, r]) => Date.parse(r.resetsAt) > now - READINGS_KEPT_MS)) as StoredReadings,
+      Object.fromEntries(Object.entries(readings).filter(([, r]) => Date.parse(r.resetsAt) > now - keptFor(r.kind))) as StoredReadings,
       now,
     )
     await host.set(READINGS_KEY, kept)
@@ -669,6 +783,18 @@ async function measure(
   const plans = ((await host.get(PLANS_KEY)) ?? {}) as Ledger
   const observedPlan = observePlan(plans, profile, subscription, now)
   if (!isSame(observedPlan.ledger, plans)) await host.set(PLANS_KEY, observedPlan.ledger)
+
+  /* Fable's weekly cap, on plans that have one: its weights, and the weeks that reached it. */
+  const share = fableShareOf(latestEntry(observedPlan.ledger, subscription))
+  let fw: FableWeights = { weights: UNIT_WEIGHTS, source: 'assumed' }
+  let capped: Record<string, number> = {}
+  if (share !== undefined) {
+    const meter = ((await host.get(METER_KEY)) ?? {}) as StoredMeter
+    const entry = meter[subscription]
+    fw = fableWeightsOf(entry, pricesId)
+    capped = cappedWeeksOf(weeksOf(kept, subscription), share, fw.weights, entry?.pricesId === pricesId ? entry?.capped : undefined)
+  }
+  const capMoments = capMomentsOf(capped, kept)
 
   const promotions = ((await host.get(PROMOTIONS_KEY)) ?? {}) as Promotions
   const observedPromos = observePromotions(promotions, profile, subscription, now)
@@ -696,38 +822,81 @@ async function measure(
   const history = ((await host.get(HISTORY_KEY)) ?? {}) as History
   const observations = history[subscription]?.observations ?? []
 
+  /* A rejection after the reported percent of its window fell counted dollars the limit
+     no longer holds. */
+  const isAfterFall = (o: Observation) => {
+    const fall = kept[windowKey(subscription, o.kind, o.resetsAt)]?.fall
+    return fall?.isConfirmed === true && Date.parse(o.at) > fall.lastAt
+  }
+
   const windows: WindowState[] = []
+  /* The week's estimate in weighted dollars, for Fable's window. */
+  let weekE: { allowance: RangeEstimate; left: RangeEstimate } | undefined
   for (const { w, limit } of active) {
     const tally = out.windows[w.name]
     if (!tally) continue
     const startedAt = regimeStart(regimes, subscription, w.kind)
     const regime = currentRegime(regimes, subscription, w.kind)
     /* Closed windows of this subscription and regime: one past point each, and the
-       crossings that measure the within-window spread. */
-    const closed = all
-      .filter(r => r.org === subscription && r.kind === w.kind && Date.parse(r.resetsAt) <= now && Date.parse(r.resetsAt) >= startedAt)
-      .map(r => regimeView(r, startedAt))
-    const rejections = observations.filter(o => Date.parse(o.resetsAt) > now - HISTORY_DAYS * DAY_MS)
+       crossings that measure the within-window spread. Those Fable's cap distorts are left
+       out. */
+    let fableCapped = 0
+    const closed = Object.entries(kept)
+      .filter(([, r]) => r.org === subscription && r.kind === w.kind && Date.parse(r.resetsAt) <= now && Date.parse(r.resetsAt) >= startedAt)
+      .filter(([k, r]) => {
+        const isOut = share !== undefined && isLeftOutForFable(w.kind, k, r, capped, capMoments)
+        if (isOut) fableCapped++
+        return !isOut
+      })
+      .map(([, r]) => regimeView(r, startedAt))
+    const rejections = observations.filter(o => Date.parse(o.resetsAt) > now - HISTORY_DAYS * DAY_MS && !isAfterFall(o))
     const spread = calibrateOmega(closed, w.kind, now, resolution, rounding)
     const past = pastPoints(closed, rejections, w.kind, resolution, rounding, spread.omega).filter(p => p.at >= startedAt)
     const key = windowKey(subscription, w.kind, limit.resetsAt)
     const stored = kept[key]
     const current = stored ? regimeView(stored, startedAt) : undefined
     const isUnpriced = isUnpricedTally(tally)
+    /* After a fall the allowance is the one known when the percent fell: the window's
+       whole dollars would floor it at dollars the limit no longer holds. */
+    const isFallen = stored?.fall?.isConfirmed === true
+    const latest = isFallen && current ? latestSideOf(current) : undefined
+    const livePercent = isFallen
+      ? undefined
+      : limit.observedAt !== undefined && now - limit.observedAt <= FRESH_MS
+        ? limit.percentUsed
+        : undefined
+    const usedUsd = latest ? latest.usd : tally.usd
     const e =
-      current && !isUnpriced
-        ? estimate(current, tally.usd, {
+      current && !isUnpriced ? estimate(current, usedUsd, { resolution, rounding, past, kind: w.kind, now, livePercent, spread }) : undefined
+    if (e?.isPriorContradicted) drafts.push({ id: `inferred:${key}`, kind: 'inferred', text: INFERRED_TEXT })
+    const remainder = limit.percentUsed !== undefined ? Math.max(0, 1 - limit.percentUsed / 100) : undefined
+    const byPercent = (a: RangeEstimate): RangeEstimate | undefined =>
+      remainder !== undefined ? { value: a.value * remainder, low: a.low * remainder, high: a.high * remainder } : undefined
+    const leftByPercent = isFallen && e ? byPercent(e.allowance) : undefined
+    if (isFallen && e) drafts.push({ id: `fell:${key}`, kind: 'inferred', text: fellText(w.title) })
+
+    if (w.kind === 'seven_day' && share !== undefined && e) {
+      const base = isUnit(fw.weights)
+        ? e
+        : weightedEstimate({
+            kind: w.kind,
+            closed,
+            current,
+            usedUsd,
+            usedX: (latest ? latest.x : tally.byFeature) ?? {},
+            fallbackX: out.windows.last7d?.byFeature,
+            weights: fw.weights,
+            rejections,
             resolution,
             rounding,
-            past,
-            kind: w.kind,
             now,
-            livePercent: limit.observedAt !== undefined && now - limit.observedAt <= FRESH_MS ? limit.percentUsed : undefined,
-            spread,
-          })
-        : undefined
-    if (e?.isPriorContradicted) drafts.push({ id: `inferred:${key}`, kind: 'inferred', text: INFERRED_TEXT })
+            livePercent,
+            startedAt,
+          }).estimate
+      if (base) weekE = { allowance: base.allowance, left: isFallen ? (byPercent(base.allowance) ?? base.left) : base.left }
+    }
     windows.push({
+      kind: w.kind,
       title: w.title,
       short: w.short,
       resetsAt: limit.resetsAt,
@@ -742,15 +911,24 @@ async function measure(
         closedWindows: closed.filter(r => Object.keys(r.byPct).length > 0).length,
         rounding,
         halfWidth: e ? Math.sqrt(e.allowance.high / e.allowance.low) - 1 : undefined,
+        ...(share !== undefined ? { fableCapped } : {}),
       },
+      ...(isFallen && stored?.fall ? { fellAt: stored.fall.lastAt } : {}),
+      ...(leftByPercent ? { leftByPercent } : {}),
     })
+  }
+
+  const fable = share !== undefined ? fableOf({ share, fw, windows, weekE, tallies: out.windows }) : undefined
+  if (fable?.isCapLikely) {
+    const week = windows.find(s => s.kind === 'seven_day')!
+    drafts.push({ id: `fable-cap:${windowKey(subscription, 'seven_day', week.resetsAt)}`, kind: 'inferred', text: FABLE_CAP_TEXT })
   }
   await queueNotices(host, subscription, drafts, now)
 
   const queue = ((await host.get(NOTICES_KEY)) ?? []) as Notice[]
   const mine = queue.filter(n => n.org === subscription)
   const isPlanUnseen = mine.some(n => n.kind === 'plan-changed' && !n.isSeen)
-  host.status(statusOf({ windows }, isPlanUnseen))
+  host.status(statusOf({ windows, fable }, isPlanUnseen))
 
   const isShared = Object.keys(observedPlan.ledger).length > 1
   const notices = [
@@ -762,6 +940,8 @@ async function measure(
       .filter(n => n.kind === 'promotion' && /^promo-(end|gone):/.test(n.id) && n.at > now - NOTICE_SHOWN_MS)
       .map(n => n.text),
     ...(windows.some(s => s.estimate?.isPriorContradicted) ? [INFERRED_TEXT] : []),
+    ...windows.filter(s => s.fellAt !== undefined && s.estimate).map(s => fellText(s.title)),
+    ...(fable?.isCapLikely ? [FABLE_CAP_TEXT] : []),
   ]
 
   const summary: Summary = {
@@ -772,15 +952,59 @@ async function measure(
     notices,
     last24hUsd: out.windows.last24h?.usd,
     last7dX: out.windows.last7d?.byFeature,
+    ...(fable ? { fable } : {}),
     sinceResetLabel: windows.find(s => s.sinceResetLabel)?.sinceResetLabel,
     files: out.files,
     ms: out.ms,
   }
   if (mayRecord) {
-    meterContext = { subscription, pricesId }
+    meterContext = { subscription, pricesId, ...(share !== undefined ? { share } : {}) }
     follow(host, meterContext)
   }
   return summary
+}
+
+/* Fable's share of the week, derived: used from the week's tally (or since a fall of its
+   percent), and with a weekly estimate in weighted dollars, the cap in Fable's API dollars.
+   Absent without a week, and on the measure that confirms a fall, before its tally exists. */
+function fableOf(input: {
+  share: number
+  fw: FableWeights
+  windows: readonly WindowState[]
+  weekE: { allowance: RangeEstimate; left: RangeEstimate } | undefined
+  tallies: Record<string, WindowTally>
+}): FableReport | undefined {
+  const { share, fw, windows, weekE, tallies } = input
+  const week = windows.find(s => s.kind === 'seven_day')
+  if (!week) return undefined
+  const isSinceFall = week.fellAt !== undefined
+  const t = isSinceFall ? tallies[`week${AT_FALL}`] : week.tally
+  if (!t) return undefined
+  const usedUsd = t.fable?.usd ?? 0
+  const requests = t.fable?.requests ?? 0
+  const weekX = t.byFeature ?? {}
+  const fableE = fableUseE(fw.weights, weekX, usedUsd)
+  const x = Object.keys(weekX).some(isFableFeature) ? weekX : (tallies.last7d?.byFeature ?? {})
+  const mix = familyConversion(fw.weights, x, isFableFeature)
+  const weightSource = isFableInFit(fw.weights, x) ? fw.source : 'assumed'
+  const isMeasured = weightSource !== 'assumed' && fw.weights.model !== 'M0'
+  const range = weekE ? fableWindow({ weekE, fableE, mix, share }) : undefined
+  return {
+    title: 'Fable this week',
+    share,
+    usedUsd,
+    requests,
+    ...(range ? { allowance: range.allowance, left: range.left } : {}),
+    ...(range?.usedShare !== undefined ? { usedShare: range.usedShare } : {}),
+    isCapLikely: range?.isCapLikely ?? false,
+    weightSource,
+    ...(weightSource === 'weekly' && fw.weeks !== undefined ? { weeks: fw.weeks } : {}),
+    mix: weightSource === 'assumed' ? { value: 1, low: 1, high: 1 } : mix,
+    ...(isMeasured ? { relativeTo: groupLabel(fw.weights.reference), isReference: isFableFeature(fw.weights.reference) } : {}),
+    ...(isSinceFall ? { isSinceFall } : {}),
+    resetLong: week.tally.resetLong ?? week.resetsAt,
+    resetIn: week.tally.resetIn ?? '',
+  }
 }
 
 /* The backfill and the model fit after a measure, one run at a time; a measure that ends
@@ -915,8 +1139,10 @@ function regimeWindowsOf(readings: StoredReadings, context: MeterContext, kind: 
     .filter(({ w }) => Object.keys(w.byPct).length > 0)
 }
 
-/* What the model fit rests on, read from the store. */
-async function meterInputOf(host: Host, context: MeterContext) {
+/* What the model fit rests on, read from the store. On plans with a Fable cap, the weeks
+   that reached it and the 5-hour windows after it are left out, under the weights of the
+   stored fit `was`; a week it left out stays out. */
+async function meterInputOf(host: Host, context: MeterContext, was: MeterEntry | undefined) {
   const now = await host.now()
   const readings = ((await host.get(READINGS_KEY)) ?? {}) as StoredReadings
   const regimes = ((await host.get(REGIMES_KEY)) ?? {}) as Regimes
@@ -924,9 +1150,24 @@ async function meterInputOf(host: Host, context: MeterContext) {
   const resolution = resolutionOf(all)
   const regimeStarts: Record<string, number> = {}
   const closed: Record<string, { key: string; w: StoredReading }[]> = {}
+  let capped: Record<string, number> | undefined
+  const cappedCounts: Record<string, number> = {}
+  if (context.share !== undefined) {
+    const tableReadings = Object.fromEntries(Object.entries(readings).filter(([, r]) => r.pricesId === context.pricesId)) as StoredReadings
+    capped = cappedWeeksOf(
+      weeksOf(tableReadings, context.subscription),
+      context.share,
+      fableWeightsOf(was, context.pricesId).weights,
+      was?.pricesId === context.pricesId ? was?.capped : undefined,
+    )
+  }
+  const moments = capped ? capMomentsOf(capped, readings) : []
   for (const kind of KINDS) {
     regimeStarts[kind] = regimeStart(regimes, context.subscription, kind)
-    closed[kind] = regimeWindowsOf(readings, context, kind, regimeStarts[kind] ?? 0, now)
+    const windows = regimeWindowsOf(readings, context, kind, regimeStarts[kind] ?? 0, now)
+    const kept = capped ? windows.filter(({ key, w }) => !isLeftOutForFable(kind, key, w, capped!, moments)) : windows
+    cappedCounts[kind] = windows.length - kept.length
+    closed[kind] = kept
   }
   const qualifying = (kind: Kind) => (closed[kind] ?? []).filter(({ w }) => isFeatureComplete(w))
   return {
@@ -934,6 +1175,8 @@ async function meterInputOf(host: Host, context: MeterContext) {
     resolution,
     regimeStarts,
     closed,
+    capped,
+    cappedCounts,
     fiveHour: qualifying('five_hour'),
     weekly: qualifying('seven_day'),
     /* Closed windows of every subscription that may show the rounding rule, as the measure
@@ -964,10 +1207,11 @@ function prospectiveOf(was: MeterEntry | undefined, input: Awaited<ReturnType<ty
 
 /* The stored model fit of the subscription, refitted when its fingerprint changed: model
    selection on the 5-hour windows under the union, the rounding rule from the weighted
-   views it gives, selection again under that rule, then the transfer to the weeks. The
-   estimates do not use it. */
+   views it gives, selection again under that rule, then the transfer to the weeks. Of the
+   estimates, only Fable's window uses it. */
 async function refreshMeter(host: Host, context: MeterContext): Promise<MeterEntry | undefined> {
-  const input = await meterInputOf(host, context)
+  const was = (((await host.get(METER_KEY)) ?? {}) as StoredMeter)[context.subscription]
+  const input = await meterInputOf(host, context, was)
   const fingerprint = fingerprintOf({
     fiveHour: input.fiveHour,
     weekly: input.weekly,
@@ -976,9 +1220,15 @@ async function refreshMeter(host: Host, context: MeterContext): Promise<MeterEnt
     schema: SCHEMA,
     stamp: HOOKS_STAMP,
   })
-  const stored = ((await host.get(METER_KEY)) ?? {}) as StoredMeter
-  const was = stored[context.subscription]
-  if (was?.fingerprint === fingerprint) return was
+  const capped = input.capped ? { capped: input.capped } : {}
+  if (was?.fingerprint === fingerprint) {
+    if (isSame(was.capped, input.capped)) return was
+    /* A week capped while still open leaves the fit's windows as they were. */
+    const updated: MeterEntry = { ...was, ...capped }
+    const stored = ((await host.get(METER_KEY)) ?? {}) as StoredMeter
+    await host.set(METER_KEY, { ...stored, [context.subscription]: updated })
+    return updated
+  }
   const prospective = prospectiveOf(was, input, context.pricesId)
   const { resolution } = input
   const fiveHour = input.fiveHour.map(({ w }) => w)
@@ -1006,16 +1256,22 @@ async function refreshMeter(host: Host, context: MeterContext): Promise<MeterEnt
         : { weights: selection.weights, omega: transfer.omega.selected, omegaM0: transfer.omega.M0 },
     },
     prospective,
+    ...capped,
   }
-  if (!isSame(entry, was)) await host.set(METER_KEY, { ...stored, [context.subscription]: entry })
+  if (!isSame(entry, was)) {
+    const stored = ((await host.get(METER_KEY)) ?? {}) as StoredMeter
+    await host.set(METER_KEY, { ...stored, [context.subscription]: entry })
+  }
   return entry
 }
 
 /** The status line: what is left of each window's allowance. */
-export function statusOf(summary: Pick<Summary, 'windows'>, isPlanUnseen: boolean) {
+export function statusOf(summary: Pick<Summary, 'windows' | 'fable'>, isPlanUnseen: boolean) {
+  const f = summary.fable
   return statusLine(
-    summary.windows.map(s => ({ short: s.short, usedUsd: s.tally.usd, allowance: s.estimate?.allowance, left: s.estimate?.left })),
+    summary.windows.map(s => ({ short: s.short, usedUsd: s.tally.usd, allowance: s.estimate?.allowance, left: s.leftByPercent ?? s.estimate?.left })),
     isPlanUnseen,
+    f ? { usedUsd: f.usedUsd, left: f.left, isCapLikely: f.isCapLikely } : undefined,
   )
 }
 
@@ -1107,27 +1363,30 @@ export async function takeToasts(host: Host) {
 }
 
 export function toReport(summary: Summary, now: number): UsageReport {
-  const windows: WindowReport[] = summary.windows.map(s => ({
-    title: s.title,
-    short: s.short,
-    usedUsd: s.tally.usd,
-    requests: s.tally.requests,
-    resetLong: s.tally.resetLong ?? s.resetsAt,
-    resetIn: s.tally.resetIn ?? '',
-    left: s.estimate
-      ? { value: Math.max(0, s.estimate.left.value), low: Math.max(0, s.estimate.left.low), high: Math.max(0, s.estimate.left.high) }
-      : undefined,
-    allowance: s.estimate?.allowance,
-    confidence: s.estimate?.confidence,
-    nextTick: s.estimate?.nextTick,
-    pastWeight: s.estimate?.pastWeight,
-    isPriorContradicted: s.estimate?.isPriorContradicted,
-    isSpreadAssumed: s.estimate?.isSpreadAssumed,
-    percent: s.percent,
-    percentAgeMinutes: s.percentAt !== undefined ? Math.max(0, Math.round((now - s.percentAt) / MINUTE_MS)) : undefined,
-    basis: basisOf(s.estimate, s.isUnpriced, s.sinceResetLabel),
-    isCalibrated: s.calibration.isCalibrated,
-  }))
+  const windows: WindowReport[] = summary.windows.map(s => {
+    const isFallen = s.fellAt !== undefined
+    const left = s.leftByPercent ?? s.estimate?.left
+    return {
+      title: s.title,
+      short: s.short,
+      usedUsd: s.tally.usd,
+      requests: s.tally.requests,
+      resetLong: s.tally.resetLong ?? s.resetsAt,
+      resetIn: s.tally.resetIn ?? '',
+      left: left ? { value: Math.max(0, left.value), low: Math.max(0, left.low), high: Math.max(0, left.high) } : undefined,
+      allowance: s.estimate?.allowance,
+      confidence: s.estimate?.confidence,
+      nextTick: isFallen ? undefined : s.estimate?.nextTick,
+      pastWeight: s.estimate?.pastWeight,
+      isPriorContradicted: s.estimate?.isPriorContradicted,
+      isSpreadAssumed: s.estimate?.isSpreadAssumed,
+      percent: s.percent,
+      percentAgeMinutes: s.percentAt !== undefined ? Math.max(0, Math.round((now - s.percentAt) / MINUTE_MS)) : undefined,
+      basis: basisOf(s.estimate, s.isUnpriced, s.sinceResetLabel, isFallen),
+      isCalibrated: s.calibration.isCalibrated,
+      ...(isFallen ? { isFallen } : {}),
+    }
+  })
   const widest = summary.windows[summary.windows.length - 1]
   const byModel: ModelSpend[] = Object.entries(widest?.tally.byModel ?? {})
     .map(([model, spend]) => ({ model, ...spend }))
@@ -1139,6 +1398,7 @@ export function toReport(summary: Summary, now: number): UsageReport {
     last24hUsd: summary.last24hUsd,
     sinceResetLabel: summary.sinceResetLabel,
     windows,
+    ...(summary.fable ? { fable: summary.fable } : {}),
     byModel,
     byModelTitle: `By model · ${(widest?.title ?? '').toLowerCase()}`,
     notes: notesOf(widest?.tally),
@@ -1182,11 +1442,42 @@ export async function spendReport(host: Host, range: readonly string[]): Promise
 /** What this session has seen of other sessions and of its own readings. */
 export const diagnosticsOf = (): Readonly<Diagnostics> => diagnostics
 
-type CheckSummary = { sessions: number; medianRatio: number | null; lowRatio: number | null; highRatio: number | null; error?: string }
+/* The helper's limit diagnostics: quotaLimits records it does not measure, grouped, and the
+   requests whose usage carries a fallback credit. */
+type UnknownLimit = { kind: string | null; status: string | null; overageStatus: string | null; isUsingOverage: boolean; count: number; lastAt: string | null }
 
-const NOT_RECORDED: Record<'unpriced' | 'unattributed', string> = {
+type CheckSummary = {
+  sessions: number
+  medianRatio: number | null
+  lowRatio: number | null
+  highRatio: number | null
+  unknownLimits?: UnknownLimit[]
+  creditMarked?: { requests: number; lastAt: string | null }
+  error?: string
+}
+
+type Unrecorded = 'unpriced' | 'unattributed' | 'fell'
+
+const NOT_RECORDED: Record<Unrecorded, string> = {
   unpriced: 'too many of its requests go to unpriced models (see Prices)',
   unattributed: 'the subscription is a guess (see Subscription)',
+  fell: 'the reported percent fell in this window, as after a limit reset',
+}
+
+/* Rate limits Claude Code reported or recorded that this module does not measure. */
+function limitsItem(liveKinds: readonly string[], check: CheckSummary | undefined): CheckItem {
+  const parts: string[] = []
+  if (liveKinds.length > 0) parts.push(`reported live: ${liveKinds.join(', ')}`)
+  const groups = check?.unknownLimits ?? []
+  if (groups.length > 0)
+    parts.push(
+      `in transcripts: ${groups
+        .map(g => `${g.kind ?? 'no kind'} ${g.status ?? 'no status'}, overage ${g.overageStatus ?? 'none'}, ×${g.count}, last ${g.lastAt ?? 'unknown'}`)
+        .join('; ')}`,
+    )
+  const credited = check?.creditMarked?.requests ?? 0
+  if (credited > 0) parts.push(`${credited} request${credited === 1 ? ' carries' : 's carry'} a fallback credit`)
+  return { label: 'Limits not measured', state: 'info', text: parts.length > 0 ? `${parts.join('; ')}.` : 'none' }
 }
 
 const titles = (list: readonly string[]) => list.join(' and ')
@@ -1220,7 +1511,7 @@ function readingsItem(outcomes: Diagnostics['outcomes']): CheckItem {
   const reasons = entries.flatMap(([title, list]) =>
     list
       .map(o => o.outcome)
-      .filter((o): o is 'unpriced' | 'unattributed' => o === 'unpriced' || o === 'unattributed')
+      .filter((o): o is Unrecorded => o === 'unpriced' || o === 'unattributed' || o === 'fell')
       .map(o => `${title}: not recorded, ${NOT_RECORDED[o]}`),
   )
   if (reasons.length > 0) return { label, state: 'info', text: `${[...new Set(reasons)].join('; ')}.` }
@@ -1333,6 +1624,7 @@ export async function checkReport(host: Host): Promise<CheckReport> {
   items.push(
     pricesItem(check.out ?? { sessions: 0, medianRatio: null, lowRatio: null, highRatio: null, error: check.error ?? 'no output' }, unpriced),
   )
+  items.push(limitsItem(diagnostics.unknownKinds, check.out))
   items.push({
     label: 'Other usage',
     state: 'info',
@@ -1363,6 +1655,7 @@ export function toCalibrationReport(summary: Summary): CalibrationReport {
         measured: c.measured,
         isCalibrated: c.isCalibrated,
         halfWidth: c.halfWidth,
+        ...(c.fableCapped !== undefined ? { fableCapped: c.fableCapped } : {}),
       }
     }),
   }
@@ -1431,7 +1724,7 @@ export async function modelsReport(host: Host): Promise<ModelsReport> {
         return undefined
       })
     : undefined
-  const input = context ? await meterInputOf(host, context) : undefined
+  const input = context ? await meterInputOf(host, context, entry) : undefined
   const selection = entry?.selection ?? EMPTY_SELECTION
   const rounding = entry?.rounding ?? 'union'
 
@@ -1442,7 +1735,24 @@ export async function modelsReport(host: Host): Promise<ModelsReport> {
     { reason: 'dollars per model not stored yet', count: incomplete.length - unverified },
     { reason: 'dollars per model could not be rebuilt', count: unverified },
     { reason: 'fewer than 2 segments', count: selection.windows.excluded['too-few-segments'] ?? 0 },
+    { reason: 'Fable at or past its weekly cap', count: input?.cappedCounts.five_hour ?? 0 },
   ].filter(e => e.count > 0)
+  const cappedWeeks = input?.cappedCounts.seven_day ?? 0
+
+  /* A week and no 5-hour limit, in the forced measure and in the readings of the last 7
+     days, on an installation whose weekly readings go back at least a day. */
+  const now = await host.now()
+  const readings = ((await host.get(READINGS_KEY)) ?? {}) as StoredReadings
+  const own = summary ? Object.values(readings).filter(r => r.org === summary.subscription) : []
+  const firstWeekly = Math.min(
+    ...own.filter(r => r.kind === 'seven_day').flatMap(r => Object.values(r.byPct).map(b => b.minAt)),
+  )
+  const isFiveHourAbsent =
+    summary !== undefined &&
+    summary.windows.some(s => s.kind === 'seven_day') &&
+    !summary.windows.some(s => s.kind === 'five_hour') &&
+    !own.some(r => r.kind === 'five_hour' && Date.parse(r.resetsAt) > now - 7 * DAY_MS) &&
+    firstWeekly <= now - DAY_MS
 
   const omegas = input
     ? KINDS.map(kind => {
@@ -1493,5 +1803,7 @@ export async function modelsReport(host: Host): Promise<ModelsReport> {
     },
     omegas,
     prospective,
+    ...(isFiveHourAbsent ? { isFiveHourAbsent } : {}),
+    ...(cappedWeeks > 0 ? { cappedWeeks } : {}),
   }
 }

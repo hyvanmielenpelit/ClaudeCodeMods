@@ -287,7 +287,7 @@ export function mixWeight(weights: Weights, x: Record<string, number>): number {
   return sum > 0 ? weighted / sum : 1
 }
 
-const isUnit = (weights: Weights) => weights.theta.every(t => t === 0)
+export const isUnit = (weights: Weights) => weights.theta.every(t => t === 0)
 
 const toleranceOf = (usd: number) => Math.max(FEATURE_TOLERANCE_RELATIVE * Math.abs(usd), FEATURE_TOLERANCE_ABSOLUTE)
 
@@ -987,24 +987,37 @@ export function modelConversion(weights: Weights, tally7d: Record<string, number
     const { priceKey } = partsOf(feature)
     byModel.set(priceKey, [...(byModel.get(priceKey) ?? []), feature])
   }
-  const n = weights.free.length
   const conversions: Record<string, RangeEstimate> = {}
-  for (const [priceKey, features] of byModel) {
-    let sum = 0
-    let weighted = 0
-    const byGroup = zerosOf(n)
-    for (const feature of features) {
-      const x = tally7d[feature]
-      const wx = featureWeight(weights, feature) * x
-      sum += x
-      weighted += wx
-      const g = weights.free.indexOf(groupOf(weights.model, feature))
-      if (g >= 0) byGroup[g] += wx
-    }
-    const isPriced = sum > 0 && weighted > 0
-    const gradient = isPriced ? byGroup.map(v => v / weighted) : zerosOf(n)
-    const log = { mean: isPriced ? Math.log(weighted / sum) : 0, variance: quadraticOf(gradient, weights.cov), shift: 0, df: weights.df }
-    conversions[priceKey] = rangeOf(log, 0, 0)
-  }
+  for (const [priceKey, features] of byModel) conversions[priceKey] = conversionOf(weights, features, tally7d)
   return conversions
+}
+
+/* w̄ over `features` of x taken together, with its 90% interval; 1 without dollars. */
+function conversionOf(weights: Weights, features: readonly string[], x: Record<string, number>): RangeEstimate {
+  const n = weights.free.length
+  let sum = 0
+  let weighted = 0
+  const byGroup = zerosOf(n)
+  for (const feature of features) {
+    const usd = x[feature] ?? 0
+    const wx = featureWeight(weights, feature) * usd
+    sum += usd
+    weighted += wx
+    const g = weights.free.indexOf(groupOf(weights.model, feature))
+    if (g >= 0) byGroup[g] += wx
+  }
+  const isPriced = sum > 0 && weighted > 0
+  const gradient = isPriced ? byGroup.map(v => v / weighted) : zerosOf(n)
+  const log = { mean: isPriced ? Math.log(weighted / sum) : 0, variance: quadraticOf(gradient, weights.cov), shift: 0, df: weights.df }
+  return rangeOf(log, 0, 0)
+}
+
+/** modelConversion over the member features of x taken together, instead of per price key:
+    w̄ = Σ w_f x_f / Σ x_f over the members; { 1, 1, 1 } without member dollars. `web` is
+    never a member. */
+export function familyConversion(weights: Weights, x: Record<string, number>, isMember: (feature: string) => boolean): RangeEstimate {
+  const members = Object.keys(x)
+    .sort()
+    .filter(f => f !== 'web' && isMember(f))
+  return conversionOf(weights, members, x)
 }

@@ -26,6 +26,40 @@ export type WindowReport = {
   basis: string
   /** Both spreads and the rounding rule rest on closed windows. */
   isCalibrated?: boolean
+  /** The reported percent fell within this window, as after a limit reset: later readings
+      are not recorded, and `left` follows the reported percent. */
+  isFallen?: boolean
+}
+
+/** Fable's share of the week: derived from the weekly estimate in meter units, never
+    reported. Dollars are Fable's API dollars. */
+export type FableReport = {
+  title: string
+  /** Of the weekly allowance as the meter counts it: 0.5 on Max and Ultra. */
+  share: number
+  usedUsd: number
+  requests: number
+  allowance?: RangeReport
+  left?: RangeReport
+  /** Of Fable's cap, in meter units: 0.4 for 40%. */
+  usedShare?: number
+  isCapLikely: boolean
+  /** Where Fable's weight comes from; assumed while no fit holds a Fable group. */
+  weightSource: 'five-hour' | 'weekly' | 'assumed'
+  /** Closed weeks behind a weekly fit. */
+  weeks?: number
+  /** Fable's mix weight w̄ against the reference group, with its 90% interval; 1 when
+      assumed. */
+  mix: RangeReport
+  /** "Opus 5.5": the group the weights are measured against; absent when assumed or
+      under M0. */
+  relativeTo?: string
+  /** That group is a Fable model. */
+  isReference?: boolean
+  /** Fable use is counted since the reported percent fell. */
+  isSinceFall?: boolean
+  resetLong: string
+  resetIn: string
 }
 
 export type PlanReport = {
@@ -33,7 +67,7 @@ export type PlanReport = {
   asOfLabel?: string
   isStale: boolean
   isUnknown: boolean
-  /** "Max 5x on Mon 5 Oct, 10:23": the plan last seen for this subscription. */
+  /** "Max on Mon 5 Oct, 10:23": the plan last seen for this subscription. */
   lastKnown?: string
   /** Set only while the plan is unknown: whether any profile was found at all. */
   unknownReason?: 'no-profile' | 'other-subscription'
@@ -46,6 +80,8 @@ export type UsageReport = {
   last24hUsd?: number
   sinceResetLabel?: string
   windows: WindowReport[]
+  /** Max and Ultra, while the week is measured. */
+  fable?: FableReport
   byModel: ModelSpend[]
   byModelTitle: string
   notes: string[]
@@ -98,6 +134,8 @@ export type CalibrationWindow = {
   isCalibrated: boolean
   /** Of the current 90% range, in proportion: 0.12 for ±12%. */
   halfWidth?: number
+  /** Closed windows left out: Fable at or past its weekly cap. */
+  fableCapped?: number
 }
 
 export type CalibrationReport = {
@@ -188,6 +226,10 @@ export type ModelsReport = {
   omegas: ModelsOmega[]
   /** Per window kind. */
   prospective: ModelsProspective[]
+  /** The subscription reports a week but no 5-hour limit: the study needs 5-hour windows. */
+  isFiveHourAbsent?: boolean
+  /** Closed weeks left out: Fable at or past its weekly cap. */
+  cappedWeeks?: number
 }
 
 /** A guide: its title, and its Markdown in sections that each fit one Markdown element. */

@@ -5,7 +5,7 @@ function-hook plugins. The repository is also a plugin marketplace.
 
 | Mod | What it does |
 |---|---|
-| [usage-dollars](usage-dollars) | Subscription usage for the 5-hour window and the week as API-equivalent dollars: the estimated allowance first, then used and left, with 90% ranges; spending reports by date range. |
+| [usage-dollars](usage-dollars) | Subscription usage for the 5-hour window and the week as API-equivalent dollars: the estimated allowance first, then used and left, with 90% ranges; on Max and Ultra, Fable's derived share of the week; spending reports by date range. |
 
 ## Installing
 
@@ -106,7 +106,7 @@ calibration takes, and what to do when something changes.
 ### The plan line and plan changes
 
 The plan comes from the signed-in account profile in `~/.claude.json` (or
-`$CLAUDE_CONFIG_DIR/.claude.json`), for example "Plan: Max 20x · profile as of Mon 5 Oct,
+`$CLAUDE_CONFIG_DIR/.claude.json`), for example "Plan: Ultra · profile as of Mon 5 Oct,
 10:23". Claude Code refreshes that profile on its own schedule, sometimes a day or more
 apart, so the card always says how old it is and adds "(may be out of date)" after a week.
 The profile describes only the subscription Claude Code is signed in to now: a session that
@@ -115,8 +115,8 @@ seen for it. Plan values the mod does not know are shown verbatim, never guessed
 
 The mod tells two kinds of change apart:
 
-- **Observed.** The profile reported a different plan. The card says "Plan changed: Max 5x →
-  Max 20x (between … and …)". The change is known only between the two profile fetches, and
+- **Observed.** The profile reported a different plan. The card says "Plan changed: Max →
+  Ultra (between … and …)". The change is known only between the two profile fetches, and
   estimates restart from the later one, so no reading taken under the old plan is used.
 - **Inferred.** The current window no longer fits recent windows. The card says limits *may*
   have changed and suggests a reset, but changes nothing by itself. Usage on another device,
@@ -138,7 +138,7 @@ know the limits really changed.
 | The current window's readings taken before the reset | Excluded. The estimate rebuilds from readings taken after it; the first scan after it takes one at once. |
 | The current window's used dollars | Unchanged: they are a fact about spending, not about the limit. |
 | The plan ledger, spending reports, the 24-hour figure, per-model tables | Unchanged. |
-| Stored data | Nothing is deleted. Readings stay until the normal 28-day pruning. |
+| Stored data | Nothing is deleted. Readings stay until the normal pruning: 28 days after a 5-hour window resets, 12 weeks after a week does. |
 | Other subscriptions | Unaffected. |
 
 Ranges widen to what the current readings alone support, then narrow again as the percent
@@ -230,6 +230,30 @@ stored limits and readings, as every schema change always did, so restart every 
 first. Estimates do not change in 0.8.0: `/usage-dollars models` is a read-only study of
 how each model counts against the limit relative to its API price.
 
+Upgrading to 0.9.0 drops the stored readings once, and calibration starts again: the price
+table now has Fable 5.2, Mythos 5.2 and Haiku 5.5, and the corrected Sonnet 5.5 cache-read
+price, and Fable 5.2 requests were priced as Fable 5 before. Rate-limit history is kept.
+
+### Fable this week
+
+On Max and Ultra, Fable models (Fable and Mythos) may use up to half of the weekly limit at
+no extra cost. Claude Code reports no Fable percent, so the card shows a **derived** row,
+"Fable this week", beside the week: Fable's dollars this week, its half of the weekly
+allowance, and what is left of it, never more than the week has left. The half is counted
+in meter units, as the limit counts usage: each model's weight relative to the others
+comes from the model study (`/usage-dollars models`), from the 5-hour fit, else from the
+weekly fit of four closed weeks. Until a fit holds Fable, Fable is assumed to count at the
+API price ratio, and the card says so. Settings > Usage on claude.ai shows Anthropic's own
+Fable figure to compare with.
+
+### Limit resets
+
+A limit reset, such as the Fable limit resets of the Fable 5.2 launch, gives usage back:
+the reported percent of a window falls while its dollars do not. When the percent falls
+by 2 points or more, twice in a row, the card says so; later readings of that window are
+not recorded, what is left follows the reported percent, and Fable use counts from the
+fall. Nothing needs to be done: the next window is measured as usual.
+
 ### Limits
 
 - Usage from other machines, or from claude.ai, on the same subscription is not counted,
@@ -246,6 +270,14 @@ how each model counts against the limit relative to its API price.
 - Model prices live in [`scripts/usage-cost.mjs`](usage-dollars/scripts/usage-cost.mjs).
   A model missing there is reported as unpriced, never guessed; add new models as they
   ship.
+- A verified Ultra account has no 5-hour limit, so the card shows the week only, and
+  calibration runs on weeks alone: the rounding rule needs five closed weeks and the weekly
+  fit four. Weekly readings are kept 12 weeks for this.
+- Windows at or past Fable's weekly cap are left out of calibration and of the model study
+  (a week from the moment Fable reached 95% of its cap, and the 5-hour windows with Fable
+  dollars after that moment). The test is derived and cannot tell whether usage credits
+  were billed, so a week in which the cap was reached and the user then switched models is
+  left out too.
 - Requires Node.js on `PATH`; the transcript scan runs as a child process.
 - Without a subscription (an API key), there are no limits to read and no estimates.
 
@@ -260,6 +292,7 @@ how each model counts against the limit relative to its API price.
 | `hooks/measure.ts` | The scan, stored readings and plan history per subscription, the estimates |
 | `hooks/estimate.ts` | Allowance estimate, its 90% range, rounding inference, next tick |
 | `hooks/meter.ts` | Meter weights per model and token class: segments, fits, model selection, the weekly transfer check, the prospective score |
+| `hooks/fable.ts` | Fable's derived weekly window: its weights, its cap in meter units, the weeks and 5-hour windows its cap leaves out |
 | `hooks/plan.ts` | Plan ledger, promotions, regimes, reset and undo |
 | `hooks/card.tsx` | The window, report, check, calibration, models and guide cards, their Markdown fallbacks, the status line |
 | `scripts/usage-cost.mjs` | Transcript scan, pricing, the profile, date labels (Node) |
@@ -273,8 +306,10 @@ how each model counts against the limit relative to its API price.
 
 `claude plugin test` and a `claude plugin validate` that knows every hook this mod uses
 need a recent Claude Code. The `claude` on `PATH` may be older than the build the desktop
-app bundles, under `%APPDATA%\Claude\claude-code\<version>\<build>\claude.exe` on Windows;
-run that one if `plugin test` is an unknown command.
+app bundles, under `%APPDATA%\Claude\claude-code\<version>\<build>\claude.exe` on Windows,
+or for the Microsoft Store build under
+`%LOCALAPPDATA%\Claude-Data\claude_*\claude-code\<version>\<build>\claude.exe`; run that
+one if `plugin test` is an unknown command.
 
 `node usage-dollars/scripts/usage-cost.mjs --check` sets each session's computed cost
 beside the cost Claude Code recorded for it.

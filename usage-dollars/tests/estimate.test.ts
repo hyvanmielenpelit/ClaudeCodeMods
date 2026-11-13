@@ -7,6 +7,7 @@ import {
   calibrationOf,
   estimate,
   evidenceOf,
+  fallOf,
   inferRounding,
   pastOf,
   pastPoints,
@@ -492,4 +493,18 @@ test('extra variance widens the range symmetrically in logs', () => {
   expect(wide.allowance.low).toBeLessThan(plain.allowance.low)
   const h = tQuantile(0.95, plain.log.df) * Math.sqrt(plain.log.variance + 0.01) + plain.log.shift
   expect(Math.abs(above - h)).toBeLessThan(1e-9)
+})
+
+test('fallOf: 2 points under an earlier level is a fall, 1 point is not, nor a low percent from before that level', () => {
+  const at = (minutes: number) => NOW - DAY_MS + minutes * 60 * 1000
+  let w = record(empty(), 40, 100, at(0))
+  w = record(w, 41, 103, at(10))
+  w = record(w, 41, 104, at(20))
+  w = record(w, 42, 106, at(30))
+  expect(fallOf(w, 40, at(40))).toEqual({ lastAt: at(30) })
+  expect(fallOf(w, 41, at(40))).toBeUndefined()
+  /* Received late: the percent describes a moment before level 42 was read. */
+  expect(fallOf(w, 39, at(25))).toEqual({ lastAt: at(20) })
+  expect(fallOf(w, 39, at(5))).toBeUndefined()
+  expect(fallOf(empty(), 0, at(40))).toBeUndefined()
 })

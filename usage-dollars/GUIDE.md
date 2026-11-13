@@ -25,7 +25,7 @@ to read the card, calibration, the setup check, and what to do when something go
 | `/usage-dollars help advanced` | This guide |
 | `/usage-dollars check` | The setup check: ✓, ✗ with the fix, or ℹ per item |
 | `/usage-dollars calibrate` | What each window's estimate rests on, and what is still assumed |
-| `/usage-dollars models` | How each model counts against the limit relative to its API price, as seen from this machine; a read-only study that changes no estimate |
+| `/usage-dollars models` | How each model counts against the limit relative to its API price, as seen from this machine; a read-only study that changes no window's estimate, and on Max and Ultra sets how Fable's derived row counts Fable |
 | `/usage-dollars report` | Spending in the last 24 hours, per day and per model |
 | `/usage-dollars <N>h`, `<N>d` | Spending in the last N hours or days, up to 90 days |
 | `/usage-dollars today` | Spending since local midnight |
@@ -109,8 +109,32 @@ Notices at the top of the card:
 
 | Notice | Means | Do |
 |--------|-------|----|
-| Plan changed: Max 5x → Max 20x | The profile reported a new plan; estimates restarted | Nothing |
+| Plan changed: Max → Ultra | The profile reported a new plan; estimates restarted | Nothing |
 | Usage no longer matches recent windows | Limits changed, or the subscription was used where this machine cannot see | `reset` only if you know the limits changed |
+| Fable has likely reached its weekly cap | Fable's derived use reached half of the week's allowance; further Fable requests bill usage credits or switch models, and while they bill credits the estimates run high | Nothing, or switch models |
+| This week: the reported percent fell, as after a limit reset | Usage was given back inside the window; later readings of it are not recorded, and what is left follows the reported percent | Nothing |
+
+### Fable this week
+
+On Max and Ultra the card adds a **derived** row after the week: Fable models (Fable and
+Mythos) may use up to half of the weekly limit at no extra cost, and Claude Code reports no
+Fable percent. The row shows Fable's dollars this week, its half of the weekly allowance in
+Fable's own dollars, what is left of it (never more than the week has left), and "N% of
+Fable's half used". It is never the headline. Settings > Usage on claude.ai shows
+Anthropic's own Fable figure.
+
+The half is counted as the limit counts usage, in meter units, so the row depends on how
+Fable counts against the limit relative to the other models. Its basis line says where
+that weight comes from:
+
+| Basis line | Means |
+|------------|-------|
+| Fable assumed to count at its API price ratio: not measured yet | No fit holds a Fable group yet: a fresh install, too few windows, or no Fable use in them |
+| The model study found that the API price ratio holds | The 5-hour study selected the API ratio (M0); the half is half the weekly allowance in API dollars |
+| The weekly fit (N weeks) found that the API price ratio holds | The same, from the weekly-only fit, the source on a subscription without 5-hour windows |
+| with Fable counted at ×0.82 (0.70–0.95) relative to Opus 5.5 | Fable's weight against the reference group, with its 90% interval; the range of the row counts that interval |
+| Fable 5.2 is the model the others are measured against | Fable is the reference group: its weight is 1 by definition, and the others' weights convert the week |
+| Counted since the reported percent fell | A limit reset gave the week's Fable use back; Fable is counted from it |
 
 ## 4. Calibration
 
@@ -143,18 +167,38 @@ With a few hours of use a day, and windows reaching 20% to 60%:
 |-|---------------|------|
 | **First closed window** | At the next reset | At the next weekly reset |
 | **Within-window spread** | Usually the first day | 2 weeks |
-| **Between-window spread** | About 4 windows at 30% or more, within two days | All of the last 4 weeks, each at about 30% or more |
-| **Rounding rule** | A few days | Comes from the 5-hour windows |
+| **Between-window spread** | About 4 windows at 30% or more, within two days | Usually four to six weeks at about 30% or more |
+| **Rounding rule** | A few days | Comes from the 5-hour windows; on Ultra, from the weeks, after five closed weeks |
 
-> **Important: the week is slow.** Readings are kept for 28 days, so at most four closed
-> weeks are on hand, and all four must reach about 30% for the weekly between-window spread
-> to count as measured. Lighter weeks leave it assumed, and the week stays at "2 of 3
-> measured". A rate-limit rejection counts as a full week. An assumed spread makes the
-> range wider, not wrong.
+> **Important: the week is slow.** Weekly readings are kept for 12 weeks, but past weeks
+> lose half their weight every 14 days, so the weekly between-window spread counts as
+> measured only after about four to six weeks that reached about 30%. Lighter weeks leave
+> it assumed, and the week stays at "2 of 3 measured". A rate-limit rejection counts as a
+> full week. An assumed spread makes the range wider, not wrong.
+
+> **Note: Ultra has no 5-hour window.** A verified Ultra account reports only the week, so
+> calibration runs on weeks alone, and the rounding rule waits for five closed weeks.
+
+> **Note: windows at Fable's cap are left out.** On Max and Ultra, a closed week in which
+> Fable reached 95% of its cap, and a closed 5-hour window with Fable dollars that ended
+> after that moment, do not calibrate: usage credits billed past the cap move neither
+> percent. Calibration lists them as "closed windows left out: Fable at or past its weekly
+> cap". The test cannot see credits, so a week in which you reached the cap and then
+> switched models is left out too.
 
 > **Note: the rounding rule may never resolve.** When the allowance drifts within windows,
 > closed windows can contradict both rules. The cost is small: about ±2.6% extra width at
 > 10% used, and ±0.5% at 50%.
+
+### The model study
+
+`/usage-dollars models` fits each model's weight against the limit on closed 5-hour
+windows. On a verified Ultra account, which reports no 5-hour limit, it says "Not fitted:
+this subscription reports no 5-hour limit, and the study fits on 5-hour windows"; the
+weekly-only fit beside it appears from four closed weeks, and is then what Fable's row
+uses. Windows at or past Fable's weekly cap are left out of the study as they are of
+calibration: under Data as a reason for the 5-hour windows, and under Weeks as "N left
+out: Fable at or past its weekly cap".
 
 ## 5. The setup check
 
@@ -177,6 +221,7 @@ needs a fix, **ℹ** information.
 | **Readings** | A percent was lost and nothing explains it | A bug: report it with the debug log |
 | **Model breakdown** | Stored windows whose dollars per model and token class could not be rebuilt from the transcripts, or do not add up; as ℹ, how many windows carry them and how many wait for the backfill | Not rebuilt: nothing, those windows are left out of the model study only. Not adding up: a bug, report it with the debug log |
 | **Prices** | Dollars far from Claude Code's own costs, or a model is unpriced | Update `PRICES` in `scripts/usage-cost.mjs` |
+| **Limits not measured** | Always ℹ: rate limits of a kind this mod does not measure, live or in the transcripts, limits billed to overage, and requests that carry a fallback credit; usually "none" | Nothing; report it if a new kind appears |
 | **Other usage** | Always ℹ: other computers and claude.ai are not counted | Nothing |
 
 > **Tip:** Run `check` after every plugin update, and whenever the calibration counts stop
@@ -214,6 +259,7 @@ needs a fix, **ℹ** information.
 | Plugin updated | Running sessions keep the old hooks | Restart every session, run `check` |
 | Plan changed, card says so | Estimates restart from the change | Nothing |
 | Plan changed, card silent | Old windows mislead the estimate | `/usage-dollars reset` |
+| Limit reset used | The card says the reported percent fell; that window records nothing more, and what is left follows the percent | Nothing |
 | Promotion starts or ends | An announced one restarts that window | `reset` only if the card was silent |
 | New model in use | Its requests are unpriced; above 2% of a window, no readings | Add it to `PRICES` |
 | Price table updated | Stored readings are dropped; calibration starts over | Restart sessions on the old helper |

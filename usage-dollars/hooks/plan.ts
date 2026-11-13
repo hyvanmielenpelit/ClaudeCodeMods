@@ -80,8 +80,8 @@ export function planLabel(p: Profile) {
   const tier = p.rateLimitTier
   switch (p.organizationType) {
     case 'claude_max':
-      if (tier && /_max_5x$/.test(tier)) return 'Max 5x'
-      if (tier && /_max_20x$/.test(tier)) return 'Max 20x'
+      if (tier && /_max_5x$/.test(tier)) return 'Max'
+      if (tier && /_max_20x$/.test(tier)) return 'Ultra'
       return tier ? `Max (${tier})` : 'Max'
     case 'claude_pro':
       return 'Pro'
@@ -96,6 +96,15 @@ export function planLabel(p: Profile) {
       return tier ? `${name} (${tier})` : name
     }
   }
+}
+
+/* Max and Ultra may spend up to half of the weekly limit on Fable models at no extra cost
+   (Anthropic Help Center, article 15424964). */
+export const FABLE_WEEKLY_SHARE = 0.5
+
+/** Fable's share of the weekly limit, for plans that have one: Max and Ultra. */
+export function fableShareOf(entry: PlanEntry | undefined): number | undefined {
+  return entry?.fingerprint.split('|')[0] === 'claude_max' ? FABLE_WEEKLY_SHARE : undefined
 }
 
 const capped = <T>(list: readonly T[], max: number) => list.slice(Math.max(0, list.length - max))
@@ -123,7 +132,7 @@ export function observePlan(ledger: Ledger, profile: Profile | null | undefined,
   }
   if (prev.fingerprint === entry.fingerprint) {
     const raised = fetchedAt !== undefined && (prev.profileFetchedAt === undefined || fetchedAt > prev.profileFetchedAt)
-    const updated: PlanEntry = { ...prev, lastSeenAt: now, profileFetchedAt: raised ? fetchedAt : prev.profileFetchedAt }
+    const updated: PlanEntry = { ...prev, label: entry.label, lastSeenAt: now, profileFetchedAt: raised ? fetchedAt : prev.profileFetchedAt }
     const event: PlanEvent = { kind: 'same' }
     return { ledger: { ...ledger, [sessionOrg]: [...entries.slice(0, -1), updated] }, event }
   }

@@ -330,7 +330,15 @@ test("--check-summary takes the largest cost-state per session and model, of at 
         assert.ok(near(out.highRatio, 0.99), `high ${out.highRatio}`);
         assert.equal(typeof out.ms, "number");
         const none = run(["--check-summary"], "profile-max5x.json", CONFIG).json;
-        assert.deepEqual({ ...none, ms: 0 }, { sessions: 0, medianRatio: null, lowRatio: null, highRatio: null, ms: 0 });
+        assert.deepEqual({ ...none, ms: 0 }, {
+            sessions: 0,
+            medianRatio: null,
+            lowRatio: null,
+            highRatio: null,
+            unknownLimits: [],
+            creditMarked: { requests: 0, lastAt: null },
+            ms: 0
+        });
     }
     finally
     {
@@ -358,6 +366,74 @@ test("pricesId is stable, and changes with a price", () =>
     {
         fs.rmSync(dir, { recursive: true, force: true });
     }
+});
+
+/* session-u, of ORG_A, on 2026-11-10: Fable 5.2 and Mythos 5.2 (with one web search and a
+   cache read), Sonnet 5.5 cache reads, Haiku 5.5 at 100,000 and 100,001 prompt tokens, two
+   point releases with no price, suffixed ids, one request with a fallback credit, and
+   quotaLimits records of an unknown kind (twice) and one billed to overage. */
+const ULTRA_CONFIG = path.join(FIXTURES, "config-ultra");
+const ULTRA_WINDOW = "week,2026-11-09T00:00:00.000Z,2026-11-16T00:00:00.000Z";
+
+function ultraWeek()
+{
+    return run(["--session", "session-u", "--window", ULTRA_WINDOW], "profile-max20x.json", ULTRA_CONFIG).json.windows.week;
+}
+
+test("the November 2026 prices: Fable 5.2, Mythos 5.2, Sonnet 5.5 cache reads, suffixed ids", () =>
+{
+    const { byModel } = ultraWeek();
+    assert.ok(near(byModel["claude-fable-5-2"].usd, 8), `fable ${byModel["claude-fable-5-2"].usd}`);
+    assert.ok(near(byModel["claude-mythos-5-2"].usd, 4 + 0.2 + 0.01), `mythos ${byModel["claude-mythos-5-2"].usd}`);
+    assert.ok(near(byModel["claude-sonnet-5-5"].usd, 0.1), `sonnet ${byModel["claude-sonnet-5-5"].usd}`);
+    assert.ok(near(byModel["claude-sonnet-4-5-20250929"].usd, 3));
+    assert.ok(near(byModel["anthropic.claude-opus-4-6-v1:0"].usd, 5));
+    assert.ok(near(byModel["claude-opus-5-5[1m]"].usd, 4));
+});
+
+test("Haiku 5.5 is priced on each request's prompt length: input, cache read and cache write tokens", () =>
+{
+    const { byModel, byFeature } = ultraWeek();
+    /* 100,000 prompt tokens: the low tier. */
+    assert.ok(near(byModel["claude-haiku-5-5"].usd, 0.004 + 0.5 + 0.0005 + 0.00125), `low ${byModel["claude-haiku-5-5"].usd}`);
+    /* 100,001: the high tier. */
+    assert.ok(nearRelative(byModel["claude-haiku-5-5-20261101"].usd, 0.0200005 + 2.5 + 0.0025 + 0.00625), `high ${byModel["claude-haiku-5-5-20261101"].usd}`);
+    /* Both tiers share one feature key. */
+    assert.ok(nearRelative(byFeature["claude-haiku-5-5/out"], 0.5 + 2.5));
+});
+
+test("a point release matches no key, and is reported unpriced", () =>
+{
+    const week = ultraWeek();
+    assert.deepEqual([...week.unpricedModels].sort(), ["claude-fable-5-3", "claude-opus-5-6"]);
+    assert.equal(week.unpricedRequests, 2);
+    assert.equal(week.byModel["claude-fable-5-3"], undefined);
+});
+
+test("the fable sub-tally counts Fable 5.2 and Mythos 5.2, their web searches included, and nothing else", () =>
+{
+    const week = ultraWeek();
+    assert.equal(week.fable.requests, 2);
+    assert.ok(near(week.fable.usd, 8 + 4.21), `fable ${week.fable.usd}`);
+    assert.ok(near(week.byFeature.web, 0.01));
+    const plain = run(["--session", "session-m", "--window", MIX_WINDOW], "profile-max5x.json", MIX_CONFIG).json.windows.session;
+    /* Fable 5.1 in the mix fixture: every Fable feature and its web search. */
+    const fableFeatures = sum(Object.entries(MIX_FEATURES).filter(([k]) => k.startsWith("claude-fable-")).map(([, v]) => v));
+    assert.ok(near(plain.fable.usd, fableFeatures + 0.01), `mix fable ${plain.fable.usd}`);
+});
+
+test("--check-summary and --history report unknown limit kinds, overage, and fallback credits", () =>
+{
+    const expected = [
+        { kind: "five_hour", status: "allowed", overageStatus: "allowed", isUsingOverage: true, count: 1, lastAt: "2026-11-10T10:40:00.000Z" },
+        { kind: "seven_day_fable", status: "allowed_warning", overageStatus: "allowed", isUsingOverage: false, count: 2, lastAt: "2026-11-10T10:31:00.000Z" }
+    ];
+    const summary = run(["--check-summary"], "profile-max20x.json", ULTRA_CONFIG).json;
+    assert.deepEqual(summary.unknownLimits, expected);
+    assert.deepEqual(summary.creditMarked, { requests: 1, lastAt: "2026-11-10T10:10:00.000Z" });
+    const history = run(["--session", "session-u", "--history", "14"], "profile-max20x.json", ULTRA_CONFIG).json;
+    assert.deepEqual(history.unknownLimits, expected);
+    assert.equal(typeof history.creditMarked.requests, "number");
 });
 
 test("the promotion fixture yields its limit and end", () =>

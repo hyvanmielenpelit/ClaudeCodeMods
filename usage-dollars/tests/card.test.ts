@@ -1,7 +1,19 @@
 import { expect, test } from 'claude-code/testing'
 
-import { compact, guideOf, guideSections, markdownGuide, markdownModels, markdownWaiting, statusLine } from '../hooks/card'
-import type { ModelsFit, ModelsReport, ModelsTransfer } from '../types'
+import {
+  compact,
+  fableBasis,
+  guideOf,
+  guideSections,
+  markdownCalibration,
+  markdownGuide,
+  markdownModels,
+  markdownWaiting,
+  markdownWindows,
+  statusLine,
+} from '../hooks/card'
+import { FABLE_CAP_TEXT } from '../hooks/measure'
+import type { CalibrationWindow, FableReport, ModelsFit, ModelsReport, ModelsTransfer, UsageReport } from '../types'
 
 const range = (value: number) => ({ value, low: value * 0.9, high: value * 1.1 })
 
@@ -274,4 +286,136 @@ test('a selected M2 shows cache reads apart, and a rejected week falls back to t
   ).toBe(true)
   expect(text).toContain('- M2 over M0: Δ 9.3 ± 3.2 nats in 10 folds, selected\n')
   expect(text).not.toContain('Weekly-only')
+})
+
+const FABLE: FableReport = {
+  title: 'Fable this week',
+  share: 0.5,
+  usedUsd: 412,
+  requests: 230,
+  allowance: { value: 1400, low: 1100, high: 1800 },
+  left: { value: 988, low: 688, high: 1388 },
+  usedShare: 0.29,
+  isCapLikely: false,
+  weightSource: 'assumed',
+  mix: { value: 1, low: 1, high: 1 },
+  resetLong: 'Mon 16 Nov, 02:00',
+  resetIn: '5 d 14 h',
+}
+
+const usageOf = (over: Partial<UsageReport>): UsageReport => ({
+  type: 'windows',
+  plan: { label: 'Ultra', isStale: false, isUnknown: false },
+  notices: [],
+  windows: [
+    {
+      title: 'This week',
+      short: 'Week',
+      usedUsd: 900,
+      requests: 500,
+      resetLong: 'Mon 16 Nov, 02:00',
+      resetIn: '5 d 14 h',
+      allowance: { value: 2800, low: 2200, high: 3600 },
+      left: { value: 1900, low: 1300, high: 2700 },
+      confidence: 'fair',
+      basis: '3 percent levels read',
+    },
+  ],
+  byModel: [],
+  byModelTitle: 'By model · this week',
+  notes: [],
+  files: 1,
+  ms: 1,
+  ...over,
+})
+
+test('the Fable row and section are drawn after the week, derived, with its basis line', () => {
+  const text = markdownWindows(usageOf({ fable: FABLE }), 'r1')
+  expect(text).toContain('| Fable this week (derived) | ~$1,400 | $1,100 – $1,800 | |')
+  expect(text).toContain('**Fable this week** (derived) · resets Mon 16 Nov, 02:00 (in 5 d 14 h)')
+  expect(text).toContain('| Used | $412 | 230 requests |')
+  expect(text).toContain('| Left | ~$988 | $688 – $1,388 |')
+  expect(text).toContain("29% of Fable's half used")
+  expect(text).toContain('_Derived: half the weekly allowance. Fable assumed to count at its API price ratio: not measured yet._')
+  expect(text.indexOf('**This week**')).toBeLessThan(text.indexOf('**Fable this week**'))
+  expect(markdownWindows(usageOf({}), 'r2')).not.toContain('Fable')
+})
+
+test("Fable's basis line says where its weight comes from", () => {
+  const measured = { ...FABLE, mix: { value: 0.82, low: 0.7, high: 0.95 } }
+  expect(fableBasis({ ...FABLE, weightSource: 'five-hour' })).toBe(
+    'Derived: half the weekly allowance. The model study found that the API price ratio holds.',
+  )
+  expect(fableBasis({ ...FABLE, weightSource: 'weekly', weeks: 4 })).toBe(
+    'Derived: half the weekly allowance. The weekly fit (4 weeks) found that the API price ratio holds.',
+  )
+  expect(fableBasis({ ...measured, weightSource: 'five-hour', relativeTo: 'Fable 5.2', isReference: true })).toBe(
+    'Derived: half the weekly allowance in meter units. Fable 5.2 is the model the others are measured against, from the model study.',
+  )
+  expect(fableBasis({ ...measured, weightSource: 'five-hour', relativeTo: 'Opus 5.5', isReference: false })).toBe(
+    'Derived: half the weekly allowance in meter units, with Fable counted at ×0.82 (0.70–0.95) relative to Opus 5.5, from the model study.',
+  )
+  expect(fableBasis({ ...measured, weightSource: 'weekly', weeks: 4, relativeTo: 'Opus 5.5', isReference: false })).toBe(
+    'Derived: half the weekly allowance in meter units, with Fable counted at ×0.82 (0.70–0.95) relative to Opus 5.5, from the weekly fit (4 weeks).',
+  )
+  expect(fableBasis({ ...FABLE, isSinceFall: true })).toMatch(/^Counted since the reported percent fell\. Derived: /)
+})
+
+test('the status line adds Fable once it is used this week', () => {
+  const week = [{ short: 'Week', usedUsd: 900, allowance: range(2800), left: range(1900) }]
+  expect(statusLine(week, false, { usedUsd: 0, left: range(1400), isCapLikely: false })).toBe('Week ~$1.9k left of $2.8k')
+  expect(statusLine(week, false, { usedUsd: 412, left: range(988), isCapLikely: false })).toBe('Week ~$1.9k left of $2.8k · Fable ~$988 left')
+  expect(statusLine(week, false, { usedUsd: 1500, left: range(0), isCapLikely: true })).toBe('Week ~$1.9k left of $2.8k · Fable at cap')
+  expect(statusLine(week, false, { usedUsd: 40, isCapLikely: false })).toBe('Week ~$1.9k left of $2.8k · Fable $40 used')
+})
+
+test('the Fable cap notice and a fallen window are drawn as the report gives them', () => {
+  const fell = '3 percent levels read · the reported percent fell in this window: left follows the percent'
+  const report = usageOf({ notices: [FABLE_CAP_TEXT], fable: { ...FABLE, isCapLikely: true } })
+  report.windows[0] = { ...report.windows[0]!, basis: fell, isFallen: true }
+  const text = markdownWindows(report, 'r3')
+  expect(text).toContain(`- ${FABLE_CAP_TEXT}`)
+  expect(text).toContain(`_${fell}_`)
+})
+
+test('a subscription with no 5-hour limit is told why the models study is not fitted, and Fable-capped windows are counted', () => {
+  const text = markdownModels(
+    modelsOf({
+      isFitted: false,
+      qualifying: 0,
+      fits: [],
+      isFiveHourAbsent: true,
+      cappedWeeks: 2,
+      windows: { used: 0, excluded: [{ reason: 'Fable at or past its weekly cap', count: 3 }] },
+    }),
+    'm9',
+  )
+  expect(text).toContain('**Not fitted: this subscription reports no 5-hour limit, and the study fits on 5-hour windows**')
+  expect(text).toContain('- Week: uses the API ratio, as the 5-hour windows do')
+  expect(text).toContain('  - 3 left out: Fable at or past its weekly cap')
+  expect(text).toContain('  - 2 left out: Fable at or past its weekly cap')
+  expect(markdownModels(modelsOf({ isFitted: false, qualifying: 0, fits: [] }), 'm10')).toContain('**Not fitted yet: 0 of 4 5-hour windows')
+})
+
+test('calibration counts the closed windows left out for Fable', () => {
+  const w: CalibrationWindow = {
+    title: 'This week',
+    levels: 3,
+    ticks: 1,
+    closedWindows: 2,
+    closedForWithin: 1,
+    isWithinMeasured: false,
+    pastPoints: 2,
+    pastWeight: 1.4,
+    isBetweenMeasured: false,
+    closedForRounding: 2,
+    roundingNeeded: 5,
+    isRoundingKnown: false,
+    rounding: 'union',
+    measured: 0,
+    isCalibrated: false,
+    fableCapped: 1,
+  }
+  expect(markdownCalibration({ type: 'calibration', windows: [w] }, 'c1')).toContain('- 1 closed window left out: Fable at or past its weekly cap')
+  expect(markdownCalibration({ type: 'calibration', windows: [{ ...w, fableCapped: 0 }] }, 'c2')).not.toContain('Fable')
 })

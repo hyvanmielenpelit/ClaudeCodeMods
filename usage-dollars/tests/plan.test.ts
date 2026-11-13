@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { addRegimes, observePlan, observePromotions, planLabel, regimeStart, startOver, undoStartOver } from '../hooks/plan'
+import { addRegimes, fableShareOf, fingerprint, observePlan, observePromotions, planLabel, regimeStart, startOver, undoStartOver } from '../hooks/plan'
 import type { Profile, Regimes } from '../hooks/plan'
 
 const ORG_A = '00000000-0000-4000-8000-000000000001'
@@ -53,8 +53,8 @@ test('5x to 20x is a change between the two fetches, with a plan regime at the l
   expect(r.event.kind).toBe('changed')
   if (r.event.kind !== 'changed') return
   expect(r.event.between).toEqual([T0, fetched])
-  expect(r.event.from.label).toBe('Max 5x')
-  expect(r.event.to.label).toBe('Max 20x')
+  expect(r.event.from.label).toBe('Max')
+  expect(r.event.to.label).toBe('Ultra')
   expect(r.regime).toEqual({ startedAt: fetched, reason: 'plan' })
   expect(r.ledger[ORG_A]).toHaveLength(2)
 })
@@ -176,9 +176,28 @@ test('undoStartOver never undoes a plan regime, nor a reset a plan regime follow
   expect(undoStartOver(followed, ORG_A).isUndone).toBe(false)
 })
 
+test('a ledger entry stored under an older label is relabeled on an unchanged fingerprint', () => {
+  const ultra = profile({ rateLimitTier: 'default_claude_max_20x' })
+  const stored = { [ORG_A]: [{ fingerprint: fingerprint(ultra), label: 'Max 20x', firstSeenAt: T0, lastSeenAt: T0 }] }
+  const r = observePlan(stored, ultra, ORG_A, T0 + HOUR_MS)
+  expect(r.event.kind).toBe('same')
+  expect(r.ledger[ORG_A]?.[0]?.label).toBe('Ultra')
+  expect(r.ledger[ORG_A]?.[0]?.firstSeenAt).toBe(T0)
+})
+
+test('Fable has half of the week on Max and Ultra, and no share elsewhere', () => {
+  const entryOf = (p: Profile) => observePlan({}, p, ORG_A, T0).ledger[ORG_A]?.[0]
+  expect(fableShareOf(entryOf(profile()))).toBe(0.5)
+  expect(fableShareOf(entryOf(profile({ rateLimitTier: 'default_claude_max_20x' })))).toBe(0.5)
+  expect(fableShareOf(entryOf(profile({ organizationType: 'claude_pro', rateLimitTier: null })))).toBeUndefined()
+  expect(fableShareOf(entryOf(profile({ organizationType: 'claude_team', seatTier: 'premium' })))).toBeUndefined()
+  expect(fableShareOf(entryOf(profile({ organizationType: 'claude_enterprise' })))).toBeUndefined()
+  expect(fableShareOf(undefined)).toBeUndefined()
+})
+
 test('plan labels map known values and pass unknown ones through verbatim', () => {
-  expect(planLabel(profile())).toBe('Max 5x')
-  expect(planLabel(profile({ rateLimitTier: 'default_claude_max_20x' }))).toBe('Max 20x')
+  expect(planLabel(profile())).toBe('Max')
+  expect(planLabel(profile({ rateLimitTier: 'default_claude_max_20x' }))).toBe('Ultra')
   expect(planLabel(profile({ rateLimitTier: 'default_claude_max_50x' }))).toBe('Max (default_claude_max_50x)')
   expect(planLabel(profile({ organizationType: 'claude_pro', rateLimitTier: null }))).toBe('Pro')
   expect(planLabel(profile({ organizationType: 'claude_team', rateLimitTier: null }))).toBe('Team')

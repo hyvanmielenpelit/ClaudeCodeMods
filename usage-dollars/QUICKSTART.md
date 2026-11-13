@@ -7,6 +7,9 @@ and how much is left, right on the status line:
 5h ~$850 left of $913 · Week ~$2.7k left of $2.8k
 ```
 
+On a verified Ultra account there is no 5-hour limit, and the card shows the week only. On
+Max and Ultra, a derived Fable row shows Fable's half of the week.
+
 ## Set up once
 
 1. **Load one copy of the plugin.** Install it from the marketplace *or* load it with

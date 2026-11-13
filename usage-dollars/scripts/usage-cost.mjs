@@ -14,7 +14,8 @@
          The session's subscription and the signed-in profile, without a scan.
      node usage-cost.mjs --session <id> --history <days>
          Every rate-limit rejection in the last <days> days, with the dollars used in its
-         window up to the rejection: a window known to be exactly full.
+         window up to the rejection: a window known to be exactly full. Also the limit
+         diagnostics below.
      node usage-cost.mjs --session <id> --report <sinceISO>,<untilISO>
      node usage-cost.mjs --session <id> --report-local <from>,<to>
          Spending in a range, per day and per model. --report-local takes local dates
@@ -23,7 +24,10 @@
          Sets each session's computed cost beside the cost Claude Code itself recorded.
      node usage-cost.mjs --check-summary
          The ratios of --check over sessions of at least $0.50, one row per session and
-         model: their number, median, and 5th and 95th percentiles.
+         model: their number, median, and 5th and 95th percentiles. Also the limit
+         diagnostics: unknownLimits, the quotaLimits records of a kind not measured here or
+         billed to overage, grouped; creditMarked, the requests whose usage carries a
+         fallback credit. Both cover every transcript scanned, whatever its subscription.
 
    Every mode but --check and --check-summary also takes --label <key>,<ISO> (any number of times), answered
    as local-time labels, and --profile-file <path> in place of the config file. */
@@ -38,26 +42,42 @@ const PROJECTS = path.join(CONFIG_DIR || path.join(os.homedir(), ".claude"), "pr
 const CONFIG_FILE = CONFIG_DIR ? path.join(CONFIG_DIR, ".claude.json") : path.join(os.homedir(), ".claude.json");
 
 /* US dollars per million tokens: input, output, cache read. A cache write costs 1.25x
-   input for the 5-minute lifetime and 2x for the 1-hour one. Matched by id prefix, longest
-   first, so a dated or [1m] suffix still matches. Source: Anthropic API pricing as of
-   2026-09-25; a model missing here is reported as unpriced, never guessed. */
+   input for the 5-minute lifetime and 2x for the 1-hour one. A row may carry a
+   prompt-length tier, { rates, over: { tokens, rates } }: a request whose input, cache
+   read and cache write tokens together exceed `tokens` is priced at the `over` rates.
+   A key matches an id that equals it, or that adds only a date snapshot (-YYYYMMDD or
+   @YYYYMMDD), a Bedrock version (-v1 or -v1:0) and a [1m]-style tag, in that order;
+   keys are tried longest first. Source: Anthropic API pricing as of 2026-11-13; a model
+   missing here, a point release included, is reported as unpriced, never guessed. */
 const PRICES = {
+    "claude-fable-5-2": [8, 40, 0.20],
+    "claude-mythos-5-2": [8, 40, 0.20],
     "claude-fable-5-1": [10, 50, 0.25],
     "claude-mythos-5-1": [10, 50, 0.25],
     "claude-fable-5": [10, 50, 1.00],
+    "claude-mythos-5": [10, 50, 1.00],
     "claude-opus-5-5": [4, 20, 0.20],
     "claude-opus-5": [5, 25, 0.50],
     "claude-opus-4-8": [5, 25, 0.50],
     "claude-opus-4-7": [5, 25, 0.50],
     "claude-opus-4-6": [5, 25, 0.50],
     "claude-opus-4-5": [5, 25, 0.50],
-    "claude-sonnet-5-5": [2, 10, 0.20],
+    "claude-opus-4-1": [15, 75, 1.50],
+    "claude-opus-4": [15, 75, 1.50],
+    "claude-sonnet-5-5": [2, 10, 0.10],
     "claude-sonnet-5": [2, 10, 0.20],
     "claude-sonnet-4-6": [3, 15, 0.30],
     "claude-sonnet-4-5": [3, 15, 0.30],
+    "claude-sonnet-4": [3, 15, 0.30],
+    "claude-haiku-5-5": { rates: [0.10, 0.50, 0.01], over: { tokens: 100000, rates: [0.50, 2.50, 0.05] } },
     "claude-haiku-4-5": [1, 5, 0.10]
 };
 const PREFIXES = Object.keys(PRICES).sort((a, b) => b.length - a.length);
+/* What an id may add to its price key: date snapshot, Bedrock version, [1m]-style tag. */
+const ID_SUFFIX = /^(-\d{8}|@\d{8})?(-v\d+(:\d+)?)?(\[[^\]]*\])?$/;
+/* The models the Fable weekly limit covers, tested against a price key. hooks/fable.ts
+   holds the same definition for feature keys. */
+const FABLE_FAMILY = /^claude-(fable|mythos)(-|$)/;
 const WEB_SEARCH_USD = 0.01;
 const FAST_MULTIPLIER = 2;
 const CACHE_5M_MULTIPLIER = 1.25;
@@ -96,25 +116,39 @@ const MONTHS = {
 function priceKeyOf(model)
 {
     const id = String(model || "").replace(/^anthropic\./, "");
-    return PREFIXES.find(p => id === p || id.startsWith(p + "-") || id.startsWith(p + "[")) || null;
+    return PREFIXES.find(p => id.startsWith(p) && ID_SUFFIX.test(id.slice(p.length))) || null;
 }
 
-function priceOf(model)
+/* Cache-write tokens of a request: 5-minute and 1-hour lifetimes. */
+function cacheWritesOf(u)
 {
-    const key = priceKeyOf(model);
-    return key ? PRICES[key] : null;
+    const c = u.cache_creation || {};
+    const has = c.ephemeral_5m_input_tokens !== undefined || c.ephemeral_1h_input_tokens !== undefined;
+    return {
+        w5: has ? (c.ephemeral_5m_input_tokens || 0) : (u.cache_creation_input_tokens || 0),
+        w1: has ? (c.ephemeral_1h_input_tokens || 0) : 0
+    };
+}
+
+/* [input, output, cache read] of a PRICES key for one request; each request is priced on
+   its own prompt length. */
+function ratesOf(key, u)
+{
+    const p = PRICES[key];
+    if (Array.isArray(p))
+        return p;
+    const { w5, w1 } = cacheWritesOf(u);
+    const prompt = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + w5 + w1;
+    return prompt > p.over.tokens ? p.over.rates : p.rates;
 }
 
 function costOf(model, u)
 {
-    const p = priceOf(model);
-    if (!p)
+    const key = priceKeyOf(model);
+    if (!key)
         return null;
-    const [inp, out, read] = p;
-    const c = u.cache_creation || {};
-    const has = c.ephemeral_5m_input_tokens !== undefined || c.ephemeral_1h_input_tokens !== undefined;
-    const w5 = has ? (c.ephemeral_5m_input_tokens || 0) : (u.cache_creation_input_tokens || 0);
-    const w1 = has ? (c.ephemeral_1h_input_tokens || 0) : 0;
+    const [inp, out, read] = ratesOf(key, u);
+    const { w5, w1 } = cacheWritesOf(u);
     let usd = ((u.input_tokens || 0) * inp
         + (u.output_tokens || 0) * out
         + (u.cache_read_input_tokens || 0) * read
@@ -133,11 +167,8 @@ function costParts(model, u)
     const key = priceKeyOf(model);
     if (!key)
         return null;
-    const [inp, out, read] = PRICES[key];
-    const c = u.cache_creation || {};
-    const has = c.ephemeral_5m_input_tokens !== undefined || c.ephemeral_1h_input_tokens !== undefined;
-    const w5 = has ? (c.ephemeral_5m_input_tokens || 0) : (u.cache_creation_input_tokens || 0);
-    const w1 = has ? (c.ephemeral_1h_input_tokens || 0) : 0;
+    const [inp, out, read] = ratesOf(key, u);
+    const { w5, w1 } = cacheWritesOf(u);
     const speed = u.speed === "fast" ? FAST_MULTIPLIER : 1;
     return {
         key,
@@ -203,6 +234,7 @@ function scan(sinceMs)
     const costStates = [];
     const requests = new Map();
     const rejections = [];
+    const unknown = new Map();
     let copies = 0;
     const { found, oldestMs } = transcripts(sinceMs);
 
@@ -233,6 +265,8 @@ function scan(sinceMs)
             const q = rec.quotaLimits;
             if (q && q.status === "rejected" && q.resetsAt && SPAN_MS[q.rateLimitType] && rec.timestamp)
                 rejections.push({ session, kind: q.rateLimitType, resetsAt: q.resetsAt * 1000, at: Date.parse(rec.timestamp) });
+            if (q && (!SPAN_MS[q.rateLimitType] || q.isUsingOverage === true))
+                noteUnknownLimit(unknown, q, rec.timestamp);
             if (rec.type !== "assistant" || !rec.message || !rec.message.usage || !rec.timestamp)
                 continue;
             const ts = Date.parse(rec.timestamp);
@@ -258,10 +292,60 @@ function scan(sinceMs)
         costStates,
         requests,
         rejections,
+        unknownLimits: unknownLimitsOf(unknown),
+        creditMarked: creditMarkedOf(requests),
         copies,
         fileCount: found.length,
         oldestMs
     };
+}
+
+const MAX_UNKNOWN_LIMITS = 20;
+
+/* Counts a quotaLimits record of a kind this script does not measure, or one billed to
+   overage, under its kind, status, overage status and overage flag; nothing else of the
+   record is read out. */
+function noteUnknownLimit(groups, q, timestamp)
+{
+    const group = {
+        kind: q.rateLimitType === undefined ? null : String(q.rateLimitType),
+        status: q.status === undefined ? null : String(q.status),
+        overageStatus: q.overageStatus === undefined || q.overageStatus === null ? null : String(q.overageStatus),
+        isUsingOverage: q.isUsingOverage === true
+    };
+    const key = JSON.stringify(group);
+    const at = Date.parse(timestamp);
+    const was = groups.get(key) || { ...group, count: 0, lastMs: -Infinity };
+    was.count++;
+    if (Number.isFinite(at))
+        was.lastMs = Math.max(was.lastMs, at);
+    groups.set(key, was);
+}
+
+/* The groups latest first, at most MAX_UNKNOWN_LIMITS, each with lastAt in ISO. */
+function unknownLimitsOf(groups)
+{
+    return [...groups.values()]
+        .sort((a, b) => b.lastMs - a.lastMs)
+        .slice(0, MAX_UNKNOWN_LIMITS)
+        .map(({ lastMs, ...g }) => ({ ...g, lastAt: Number.isFinite(lastMs) ? new Date(lastMs).toISOString() : null }));
+}
+
+/* Billed requests whose usage carries a fallback_credit that is not null: a count and the
+   latest time only. */
+function creditMarkedOf(requests)
+{
+    let count = 0;
+    let lastMs = -Infinity;
+    for (const req of requests.values())
+    {
+        const v = req.usage.fallback_credit;
+        if (v === undefined || v === null)
+            continue;
+        count++;
+        lastMs = Math.max(lastMs, req.ts);
+    }
+    return { requests: count, lastAt: count > 0 ? new Date(lastMs).toISOString() : null };
 }
 
 function readJson(file)
@@ -408,6 +492,7 @@ function tally(s, org, profileOrg, sinceMs, untilMs, dayOf, isIncluded)
         requests: 0,
         byModel: {},
         byFeature: {},
+        fable: { usd: 0, requests: 0 },
         otherSubscriptionsUsd: 0,
         unattributedUsd: 0,
         unpricedRequests: 0,
@@ -448,6 +533,11 @@ function tally(s, org, profileOrg, sinceMs, untilMs, dayOf, isIncluded)
                 out.byFeature[prefix + cls] = (out.byFeature[prefix + cls] || 0) + v;
         if (split.web > 0)
             out.byFeature.web = (out.byFeature.web || 0) + split.web;
+        if (FABLE_FAMILY.test(split.key))
+        {
+            out.fable.usd += usd;
+            out.fable.requests++;
+        }
         const day = dayOf && dayOf(req.ts);
         if (day)
         {
@@ -590,7 +680,7 @@ function history(profile)
             observations.push({ kind: r.kind, resetsAt: new Date(r.resetsAt).toISOString(), at: new Date(r.at).toISOString(), usd: t.usd });
     }
     observations.sort((a, b) => a.at.localeCompare(b.at));
-    return { org, orgSource, observations, files: s.fileCount, ms: Date.now() - started };
+    return { org, orgSource, observations, unknownLimits: s.unknownLimits, creditMarked: s.creditMarked, files: s.fileCount, ms: Date.now() - started };
 }
 
 /* A local date, YYYY-MM-DD or "today", as the epoch ms of its local midnight. */
@@ -679,9 +769,8 @@ function report(profile)
 
 /* Each recorded session's cost per model, as Claude Code recorded it and as priced here. A
    session can hold more than one cost-state, so a pair can repeat. */
-function checkRows()
+function checkRows(s)
 {
-    const s = scan(0);
     const bySession = {};
     for (const req of s.requests.values())
     {
@@ -704,7 +793,7 @@ function checkRows()
 /* Prices each recorded session and sets it beside the cost Claude Code itself recorded. */
 function check()
 {
-    return checkRows().map(r => ({ session: r.sessionId.slice(0, 8), model: r.model, claudeCode: +r.claudeCode.toFixed(4), ours: +r.ours.toFixed(4), ratio: +(r.ours / r.claudeCode).toFixed(3) }));
+    return checkRows(scan(0)).map(r => ({ session: r.sessionId.slice(0, 8), model: r.model, claudeCode: +r.claudeCode.toFixed(4), ours: +r.ours.toFixed(4), ratio: +(r.ours / r.claudeCode).toFixed(3) }));
 }
 
 const MIN_CHECK_USD = 0.5;
@@ -719,12 +808,13 @@ function quantile(sorted, p)
 }
 
 /* The latest cost-state of each session and model, the one with the largest recorded cost,
-   and only those of at least MIN_CHECK_USD. */
+   and only those of at least MIN_CHECK_USD; with the scan's limit diagnostics. */
 function checkSummary()
 {
     const started = Date.now();
+    const s = scan(0);
     const largest = new Map();
-    for (const r of checkRows())
+    for (const r of checkRows(s))
     {
         const key = r.sessionId + "|" + r.model;
         const was = largest.get(key);
@@ -741,6 +831,8 @@ function checkSummary()
         medianRatio: ratios.length ? round(quantile(ratios, 0.5)) : null,
         lowRatio: ratios.length ? round(quantile(ratios, 0.05)) : null,
         highRatio: ratios.length ? round(quantile(ratios, 0.95)) : null,
+        unknownLimits: s.unknownLimits,
+        creditMarked: s.creditMarked,
         ms: Date.now() - started
     };
 }

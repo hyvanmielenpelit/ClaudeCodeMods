@@ -9,6 +9,7 @@ import type {
   CalibrationWindow,
   CheckItem,
   CheckReport,
+  FableReport,
   GuideReport,
   MeterModel,
   ModelsComparison,
@@ -68,19 +69,27 @@ const confidenceLabel = (w: WindowReport) => (w.confidence ? `${w.confidence}${w
 
 export type StatusWindow = { short: string; usedUsd: number; allowance?: RangeReport; left?: RangeReport }
 
+export type StatusFable = { usedUsd: number; left?: RangeReport; isCapLikely: boolean }
+
 /* "5h ~$850 left of $913 · Week ~$2.7k left of $2.8k": one tilde per window, since both
-   figures come from one estimate. */
-export function statusLine(windows: readonly StatusWindow[], isPlanUnseen: boolean) {
-  const text = windows
-    .map(w =>
-      !w.allowance || !w.left
-        ? `${w.short} ${compact(w.usedUsd)} used, estimating`
-        : w.left.value <= 0
-          ? `${w.short} at limit`
-          : `${w.short} ~${compact(w.left.value)} left of ${compact(w.allowance.value)}`,
+   figures come from one estimate. Fable's part follows once Fable is used this week. */
+export function statusLine(windows: readonly StatusWindow[], isPlanUnseen: boolean, fable?: StatusFable) {
+  const parts = windows.map(w =>
+    !w.allowance || !w.left
+      ? `${w.short} ${compact(w.usedUsd)} used, estimating`
+      : w.left.value <= 0
+        ? `${w.short} at limit`
+        : `${w.short} ~${compact(w.left.value)} left of ${compact(w.allowance.value)}`,
+  )
+  if (fable && fable.usedUsd > 0)
+    parts.push(
+      fable.isCapLikely || (fable.left && fable.left.value <= 0)
+        ? 'Fable at cap'
+        : fable.left
+          ? `Fable ~${compact(fable.left.value)} left`
+          : `Fable ${compact(fable.usedUsd)} used`,
     )
-    .join(' · ')
-  return `${isPlanUnseen ? '⚠ Plan changed · ' : ''}${text}`
+  return `${isPlanUnseen ? '⚠ Plan changed · ' : ''}${parts.join(' · ')}`
 }
 
 export function planLine(p: PlanReport) {
@@ -107,6 +116,29 @@ const percentLine = (w: WindowReport) =>
 const nextTickLine = (w: WindowReport) =>
   w.nextTick ? `Next tick in about ${money(w.nextTick.value)} (between ${money(w.nextTick.low)} and ${money(w.nextTick.high)})` : undefined
 
+const weightOf = (v: number) => v.toFixed(2)
+
+/* What Fable's derived window rests on: where its weight comes from. */
+export function fableBasis(f: FableReport) {
+  const since = f.isSinceFall ? 'Counted since the reported percent fell. ' : ''
+  const from = f.weightSource === 'weekly' ? `the weekly fit${f.weeks !== undefined ? ` (${plural(f.weeks, 'week')})` : ''}` : 'the model study'
+  if (f.weightSource === 'assumed')
+    return `${since}Derived: half the weekly allowance. Fable assumed to count at its API price ratio: not measured yet.`
+  if (!f.relativeTo) {
+    const finder = f.weightSource === 'weekly' ? `The weekly fit${f.weeks !== undefined ? ` (${plural(f.weeks, 'week')})` : ''}` : 'The model study'
+    return `${since}Derived: half the weekly allowance. ${finder} found that the API price ratio holds.`
+  }
+  if (f.isReference)
+    return `${since}Derived: half the weekly allowance in meter units. ${f.relativeTo} is the model the others are measured against, from ${from}.`
+  return (
+    `${since}Derived: half the weekly allowance in meter units, with Fable counted at ×${weightOf(f.mix.value)} ` +
+    `(${weightOf(f.mix.low)}–${weightOf(f.mix.high)}) relative to ${f.relativeTo}, from ${from}.`
+  )
+}
+
+const fableShareLine = (f: FableReport) =>
+  f.usedShare !== undefined ? `${Math.round(f.usedShare * 100)}% of Fable's half used` : undefined
+
 /* The row the model reads, and what the transcript shows where the card cannot be drawn. */
 export function markdownWindows(r: UsageReport, id: string) {
   const lines = ['### Usage · API-equivalent dollars', '', planLine(r.plan), '']
@@ -119,6 +151,13 @@ export function markdownWindows(r: UsageReport, id: string) {
         ? `| ${w.title} | ~${money(w.allowance.value)} | ${span(w.allowance)} | ${confidenceLabel(w)} |`
         : `| ${w.title} | estimating… | | |`,
     ),
+    ...(r.fable
+      ? [
+          r.fable.allowance
+            ? `| ${r.fable.title} (derived) | ~${money(r.fable.allowance.value)} | ${span(r.fable.allowance)} | |`
+            : `| ${r.fable.title} (derived) | estimating… | | |`,
+        ]
+      : []),
     '',
   )
   for (const w of r.windows) {
@@ -135,6 +174,22 @@ export function markdownWindows(r: UsageReport, id: string) {
       ...(reported ? [reported, ''] : []),
       ...(tick ? [tick, ''] : []),
       `_${w.basis}_`,
+      '',
+    )
+  }
+  if (r.fable) {
+    const f = r.fable
+    const used = fableShareLine(f)
+    lines.push(
+      `**${f.title}** (derived) · resets ${f.resetLong}${f.resetIn ? ` (in ${f.resetIn})` : ''}`,
+      '',
+      '| | Estimate | 90% range |',
+      '|:--|--:|--:|',
+      `| Used | ${money(f.usedUsd)} | ${count(f.requests)} requests |`,
+      `| Left | ${f.left ? `~${money(f.left.value)}` : '—'} | ${f.left ? span(f.left) : ''} |`,
+      '',
+      ...(used ? [used, ''] : []),
+      `_${fableBasis(f)}_`,
       '',
     )
   }
@@ -176,9 +231,11 @@ export function markdownSpend(r: SpendReport, id: string) {
   ].join('\n')
 }
 
+type Meterable = Pick<WindowReport, 'usedUsd' | 'allowance'>
+
 /* Used dollars in solid blue, the 90% range of the allowance as a pale band, and the
    allowance estimate as a tick, all on one scale ending at the range's top. */
-function meterSvg(w: WindowReport) {
+function meterSvg(w: Meterable) {
   const width = 600
   const height = 12
   const top = w.allowance?.high ?? w.usedUsd
@@ -196,7 +253,7 @@ function meterSvg(w: WindowReport) {
   )
 }
 
-function meterCells(w: WindowReport, cells: number) {
+function meterCells(w: Meterable, cells: number) {
   const top = w.allowance?.high ?? w.usedUsd
   const at = (usd: number) => Math.round((cells * Math.min(usd, top)) / Math.max(top, 0.01))
   const used = w.usedUsd > 0 ? Math.max(1, at(w.usedUsd)) : 0
@@ -319,6 +376,49 @@ export function windowCard(ui: Ui, r: UsageReport, columns: number) {
     )
   }
 
+  /* Fable's derived share of the week, in the week's style; never a headline. */
+  const fableSection = (f: FableReport) => {
+    const tiles = [
+      { label: 'USED', value: money(f.usedUsd), note: `${count(f.requests)} requests` },
+      { label: 'LEFT', value: f.left ? `~${money(f.left.value)}` : '—', note: f.left ? span(f.left) : 'no estimate yet' },
+    ]
+    const bar = meterCells(f, cells)
+    const used = fableShareLine(f)
+    return (
+      <Box flexDirection="column" rowGap={1}>
+        <Box flexDirection="row" justifyContent="space-between" flexWrap="wrap" columnGap={2}>
+          <Text bold>{f.title}</Text>
+          <Text dimColor>
+            Resets {f.resetLong}
+            {f.resetIn ? ` · in ${f.resetIn}` : ''}
+          </Text>
+        </Box>
+        <Box flexDirection="row" flexWrap="wrap" columnGap={4} rowGap={1}>
+          {tiles.map(tile => (
+            <Box flexDirection="column" flexGrow={1} minWidth={16}>
+              <Text dimColor>{tile.label}</Text>
+              <Text bold>{tile.value}</Text>
+              <Text dimColor>{tile.note}</Text>
+            </Box>
+          ))}
+        </Box>
+        {'Svg' in ui ? (
+          <ui.Svg source={meterSvg(f)} alt={`Fable used ${money(f.usedUsd)} of its half of the week`} />
+        ) : (
+          <Text>
+            <Text color="blue">{'█'.repeat(bar.used)}</Text>
+            <Text dimColor>{'░'.repeat(bar.free)}</Text>
+            <Text color="blue" dimColor>
+              {'▒'.repeat(bar.band)}
+            </Text>
+          </Text>
+        )}
+        {used ? <Text>{used}</Text> : undefined}
+        <Text dimColor>{fableBasis(f)}</Text>
+      </Box>
+    )
+  }
+
   return (
     <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={2} paddingY={1} rowGap={2}>
       <Box flexDirection="column">
@@ -342,6 +442,8 @@ export function windowCard(ui: Ui, r: UsageReport, columns: number) {
       </Box>
 
       {r.windows.map(section)}
+
+      {r.fable ? fableSection(r.fable) : undefined}
 
       {r.last24hUsd !== undefined ? <Text>Last 24 hours: {money(r.last24hUsd)}</Text> : undefined}
 
@@ -470,6 +572,8 @@ function calibrationLines(w: CalibrationWindow) {
       ? `Rounding rule: known (the API ${w.rounding === 'round' ? 'rounds' : 'truncates'}), from ${plural(w.closedForRounding, 'closed window')}`
       : `Rounding rule: not known; ${w.closedForRounding} of ${w.roundingNeeded} closed windows needed`,
   )
+  if (w.fableCapped !== undefined && w.fableCapped > 0)
+    lines.push(`${plural(w.fableCapped, 'closed window')} left out: Fable at or past its weekly cap`)
   if (w.halfWidth !== undefined) lines.push(`90% range now: ±${Math.round(w.halfWidth * 100)}%`)
   return lines
 }
@@ -525,7 +629,8 @@ const MODELS_SUBTITLE = "How each model's API dollars count against the limit, a
 
 const MODELS_FOOTNOTE =
   'Weights compare models with each other: each is measured against the reference group, not against the limit itself. ' +
-  'Usage on other machines and on claude.ai is not in these dollars. The estimates do not use these weights.'
+  'Usage on other machines and on claude.ai is not in these dollars. The estimates do not use these weights; ' +
+  "on Max and Ultra, Fable's derived weekly row does."
 
 /* 1.8x, 0.44x, 12x: a meter weight. */
 const times = (w: number) => `${w >= 10 ? w.toFixed(0) : w >= 1 ? w.toFixed(1) : w.toFixed(2)}x`
@@ -560,8 +665,9 @@ const notSelected = (c: ModelsComparison) => (c.folds > 0 ? `${c.to} not support
 /* The selected outcome: its title, then the weights it gives and what the weeks use. */
 function modelsHeadline(r: ModelsReport) {
   if (!r.isFitted) {
-    const title =
-      r.qualifying < r.needed
+    const title = r.isFiveHourAbsent
+      ? 'Not fitted: this subscription reports no 5-hour limit, and the study fits on 5-hour windows'
+      : r.qualifying < r.needed
         ? `Not fitted yet: ${r.qualifying} of ${r.needed} 5-hour windows with readings per model`
         : `Not fitted: ${plural(r.qualifying, '5-hour window')} with readings per model gave no fit`
     return { title, lines: [transferLine(r)] }
@@ -622,6 +728,9 @@ function modelsSections(r: ModelsReport) {
     title: 'Weeks',
     lines: [
       { text: `Closed weeks that qualify: ${t.weeks}` },
+      ...(r.cappedWeeks !== undefined && r.cappedWeeks > 0
+        ? [{ text: `${r.cappedWeeks} left out: Fable at or past its weekly cap`, isNested: true }]
+        : []),
       ...(t.weeklyFit
         ? fitLines(t.weeklyFit, `Weekly-only ${t.weeklyFit.model}, for comparison only, from ${plural(t.weeklyFit.windows, 'week')}`)
         : []),

@@ -32,9 +32,21 @@ export type Bucket = {
   maxX?: number[]
 }
 
+/* The reported percent fell within the window, as after a limit reset: lastAt is the
+   latest reading before that, seenAt when the lower percent was first received, and
+   isConfirmed that a later reading was lower too. */
+export type Fall = { lastAt: number; seenAt: number; isConfirmed: boolean }
+
 /* pricesId: the price table the dollars were computed with. features: the feature keys
    of the buckets' minX and maxX, append-only. */
-export type WindowReadings = { kind: string; resetsAt: string; byPct: Record<string, Bucket>; pricesId?: string; features?: string[] }
+export type WindowReadings = {
+  kind: string
+  resetsAt: string
+  byPct: Record<string, Bucket>
+  pricesId?: string
+  features?: string[]
+  fall?: Fall
+}
 
 export type RangeEstimate = { value: number; low: number; high: number }
 
@@ -151,6 +163,25 @@ export function record(w: WindowReadings, pct: number, usd: number, at: number, 
   if (maxX) bucket.maxX = maxX
   const byPct = { ...w.byPct, [key]: bucket }
   return features ? { ...w, features, byPct } : { ...w, byPct }
+}
+
+/* Points a percent must lie below an earlier level of its window to count as a fall. */
+export const FALL_MIN_POINTS = 2
+
+/** Whether `pct`, received at `at`, lies at least FALL_MIN_POINTS below the highest level
+    read before `at`; lastAt is then the latest reading before `at`. A percent received late
+    for an earlier moment is not a fall. */
+export function fallOf(w: WindowReadings, pct: number, at: number): { lastAt: number } | undefined {
+  let top: number | undefined
+  let lastAt: number | undefined
+  for (const [key, b] of Object.entries(w.byPct)) {
+    if (b.minAt < at) top = top === undefined ? Number(key) : Math.max(top, Number(key))
+    const before = b.maxAt < at ? b.maxAt : b.minAt < at ? b.minAt : undefined
+    if (before !== undefined) lastAt = lastAt === undefined ? before : Math.max(lastAt, before)
+  }
+  /* Keys of fine levels are not exact. */
+  if (top === undefined || lastAt === undefined || pct > top - FALL_MIN_POINTS + 1e-9) return undefined
+  return { lastAt }
 }
 
 /* The window as seen from a regime that started at startedAt: readings taken before it
