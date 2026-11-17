@@ -72,11 +72,13 @@ export type StatusWindow = { short: string; usedUsd: number; allowance?: RangeRe
 export type StatusFable = { usedUsd: number; left?: RangeReport; isCapLikely: boolean }
 
 /* "5h ~$850 left of $913 · Week ~$2.7k left of $2.8k": one tilde per window, since both
-   figures come from one estimate. Fable's part follows once Fable is used this week. */
+   figures come from one estimate. A window without an estimate shows only what is used, so
+   the line stays short enough for the desktop app's status slot, which clips the rest.
+   Fable's part follows once Fable is used this week. */
 export function statusLine(windows: readonly StatusWindow[], isPlanUnseen: boolean, fable?: StatusFable) {
   const parts = windows.map(w =>
     !w.allowance || !w.left
-      ? `${w.short} ${compact(w.usedUsd)} used, estimating`
+      ? `${w.short} ${compact(w.usedUsd)} used`
       : w.left.value <= 0
         ? `${w.short} at limit`
         : `${w.short} ~${compact(w.left.value)} left of ${compact(w.allowance.value)}`,

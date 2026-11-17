@@ -84,7 +84,7 @@ test('two estimated windows read as what is left of each allowance', () => {
 })
 
 test('a window without an estimate shows what is used', () => {
-  expect(statusLine([{ short: '5h', usedUsd: 40 }], false)).toBe('5h $40 used, estimating')
+  expect(statusLine([{ short: '5h', usedUsd: 40 }], false)).toBe('5h $40 used')
 })
 
 test('nothing left reads as at limit', () => {
@@ -93,7 +93,26 @@ test('nothing left reads as at limit', () => {
 })
 
 test('an unseen plan change leads the line', () => {
-  expect(statusLine([{ short: '5h', usedUsd: 40 }], true)).toBe('⚠ Plan changed · 5h $40 used, estimating')
+  expect(statusLine([{ short: '5h', usedUsd: 40 }], true)).toBe('⚠ Plan changed · 5h $40 used')
+})
+
+test('an unseen plan change with both windows estimating is no longer than an estimated line', () => {
+  const estimated = statusLine(
+    [
+      { short: '5h', usedUsd: 63, allowance: range(913), left: range(850) },
+      { short: 'Week', usedUsd: 63, allowance: range(2812), left: range(2749) },
+    ],
+    false,
+  )
+  const changed = statusLine(
+    [
+      { short: '5h', usedUsd: 2.86 },
+      { short: 'Week', usedUsd: 2.86 },
+    ],
+    true,
+  )
+  expect(changed).toBe('⚠ Plan changed · 5h $2.86 used · Week $2.86 used')
+  expect(changed.length).toBeLessThanOrEqual(estimated.length)
 })
 
 test('the guide splits before each level-2 heading, without carriage returns', () => {

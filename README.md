@@ -36,7 +36,7 @@ Shows on the status line, what is left of each window's estimated allowance:
 usage-dollars  5h ~$850 left of $913 · Week ~$2.7k left of $2.8k
 ```
 
-While a window has no estimate yet it reads `5h $40 used, estimating`, and once nothing is
+While a window has no estimate yet it reads `5h $40 used`, and once nothing is
 left, `5h at limit`. `⚠ Plan changed` means a plan change was observed and the card has not
 been opened since.
 

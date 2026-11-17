@@ -269,7 +269,7 @@ needs a fix, **ℹ** information.
 | Symptom | Likely cause | Do |
 |---------|--------------|----|
 | "Waiting for the first usage reading" | No reply in this session yet, and none stored | Send any message, or press the card's button |
-| Status line stays "estimating" | No reading yet, the window is still at 0% with no closed windows behind it, or unpriced models | `/usage-dollars`, read the basis line, then `check` |
+| Status line stays at "used", with nothing left shown | No reading yet, the window is still at 0% with no closed windows behind it, or unpriced models | `/usage-dollars`, read the basis line, then `check` |
 | Status line says "unavailable" | The helper failed | `check`: the Helper item |
 | Calibration counts never grow | Lost readings, or windows closing below 10% | `check`, then restart sessions |
 | Range suddenly much wider | A reset, plan, promotion or price table change | Nothing: it narrows again |
